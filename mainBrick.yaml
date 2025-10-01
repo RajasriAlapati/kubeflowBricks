@@ -14,6 +14,29 @@ implementation:
       - |
         PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet torch numpy pandas scikit-learn matplotlib seaborn boto3 feast==0.40.1 pyyaml==6.0.2 || \
         PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --user torch numpy pandas scikit-learn matplotlib seaborn boto3 feast==0.40.1 pyyaml==6.0.2
+
+        cat > feature_store.yaml << 'EOF'
+        project: movie_recommendation_lightgcn
+        provider: local
+        offline_store:
+            type: file
+        online_store:
+            type: redis
+            connection_string: localhost:6379
+        registry:
+            path: postgresql://feast:feast@localhost:5432/feast
+            registry_type: sql
+            cache_ttl_seconds: 60
+            sqlalchemy_config_kwargs:
+                echo: false
+                pool_pre_ping: true
+        entity_key_serialization_version: 3
+        EOF
+        
+        echo "=== feature_store.yaml created ==="
+        cat feature_store.yaml
+        echo "=== Starting Python script ==="
+        
         exec "$0" "$@"
       - python3
       - -u
