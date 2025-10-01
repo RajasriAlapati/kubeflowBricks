@@ -24,8 +24,8 @@ implementation:
 
         parser = argparse.ArgumentParser()
         parser.add_argument("--upload_to_minio", required=True)
-        parser.add_argument("--materialize", required=True)
-        parser.add_argument("--apply", required=True)
+        # parser.add_argument("--materialize", required=True)
+        # parser.add_argument("--apply", required=True)
         args = parser.parse_args()
 
         import torch
