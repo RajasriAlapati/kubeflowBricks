@@ -1,0 +1,890 @@
+name: lightgcn_feast_11
+description: Generates using user-provided bricks.
+
+inputs:
+  - {name: upload_to_minio, type: string}      
+  - {name: materialize, type: string}         
+  - {name: apply, type: string}    
+
+
+implementation:
+  container:
+    image: python:3.9
+    command:
+      - sh
+      - -c
+      - |
+        PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet torch numpy pandas scikit-learn matplotlib seaborn boto3 feast==0.40.1 pyyaml==6.0.2 || \
+        PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --user torch numpy pandas scikit-learn matplotlib seaborn boto3 feast==0.40.1 pyyaml==6.0.2
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os
+        from feast import Entity, ValueType
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--upload_to_minio", required=True)
+        parser.add_argument("--materialize", required=True)
+        parser.add_argument("--apply", required=True)
+        args = parser.parse_args()
+
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        import numpy as np
+        import pandas as pd
+        from sklearn.model_selection import train_test_split
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        from collections import defaultdict
+        import random
+        import warnings
+        from datetime import datetime, timedelta
+        import os
+        import boto3
+        from feast import FeatureStore
+
+
+        def load_movielens_100k(min_rating=4):
+            url = "http://files.grouplens.org/datasets/movielens/ml-100k/u.data"
+            df = pd.read_csv(url, sep="\t", names=["user", "item", "rating", "timestamp"])
+
+            df = df[df['rating'] >= min_rating]
+
+            df['user'] -= 1
+            df['item'] -= 1
+
+            user_map = {u: i for i, u in enumerate(df['user'].unique())}
+            item_map = {i: idx for idx, i in enumerate(df['item'].unique())}
+
+            df['user'] = df['user'].map(user_map)
+            df['item'] = df['item'].map(item_map)
+
+            num_users = df['user'].nunique()
+            num_items = df['item'].nunique()
+
+            return df, num_users, num_items
+
+
+        def setup_minio_client():
+            try:
+
+                s3_client = boto3.client( 
+                    's3',
+                    endpoint_url='http://minio.feast.svc.cluster.local:9000',
+                    aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID', 'minioadmin'),
+                    aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY', 'minioadmin'),
+                    region_name='us-east-1'
+                )
+                
+                bucket_name = 'feast-offline-store'
+                try:
+                    s3_client.head_bucket(Bucket=bucket_name)
+                except:
+                    try:
+                        s3_client.create_bucket(Bucket=bucket_name)
+                    except Exception as e:
+                        print(f" Failed to create bucket {bucket_name}: {e}")
+                        return None
+                        
+                return s3_client
+            except Exception as e:
+                return None
+
+        def upload_to_minio(s3_client, local_path, s3_key, bucket='feast-offline-store'):
+            try:
+                s3_client.upload_file(local_path, bucket, s3_key)
+                return True
+            except Exception as e:
+                return False
+
+        def prepare_feast_data_with_s3(df, num_users, num_items):
+            
+            os.makedirs('data', exist_ok=True)
+            current_time = datetime.now()
+            
+            s3_client = setup_minio_client()
+            if s3_client is None:
+                raise Exception("Failed to setup MinIO client")
+
+
+            movies_url = "http://files.grouplens.org/datasets/movielens/ml-100k/u.item"
+            try:
+                movie_cols = ['movie_id', 'title', 'release_date', 'video_release_date', 'imdb_url'] + \
+                            [f'genre_{i}' for i in range(19)]
+                
+                movies_df = pd.read_csv(movies_url, sep='|', names=movie_cols, encoding='latin-1')
+                movies_df['movie_id'] -= 1
+
+                unique_items_in_df = df['item'].unique()
+                item_map = {orig_id: idx for idx, orig_id in enumerate(sorted(unique_items_in_df))}
+                reverse_item_map = {v: k for k, v in item_map.items()}
+                
+                movies_df = movies_df[movies_df['movie_id'].isin(reverse_item_map.keys())]
+                movies_df['movie_id'] = movies_df['movie_id'].map({k: v for k, v in item_map.items()})
+
+                movies_df['release_year'] = pd.to_datetime(movies_df['release_date'], errors='coerce').dt.year
+                movies_df['release_year'] = movies_df['release_year'].fillna(1995).astype(int)
+
+                movie_stats = df.groupby('item')['rating'].agg(['mean', 'count']).round(2)
+                movie_stats.columns = ['avg_rating', 'num_ratings']
+                movie_stats = movie_stats.reset_index()
+
+                genre_cols = ['genre_0', 'genre_1', 'genre_2', 'genre_3', 'genre_4']
+                genre_names = ['genre_action', 'genre_comedy', 'genre_drama', 'genre_thriller', 'genre_romance']
+                
+                movie_features_df = movies_df[['movie_id'] + genre_cols + ['release_year']].copy()
+                movie_features_df.columns = ['movie_id'] + genre_names + ['release_year']
+
+                movie_features_df = movie_features_df.merge(movie_stats, left_on='movie_id', right_on='item', how='left')
+                movie_features_df = movie_features_df.drop('item', axis=1)
+                movie_features_df = movie_features_df.fillna({'avg_rating': 3.5, 'num_ratings': 1})
+
+            except Exception as e:
+                
+                movie_stats = df.groupby('item')['rating'].agg(['mean', 'count']).round(2)
+                movie_stats.columns = ['avg_rating', 'num_ratings']
+                movie_stats = movie_stats.reset_index()
+
+                movie_features_df = pd.DataFrame({
+                    'movie_id': range(num_items),
+                    'genre_action': np.random.randint(0, 2, num_items),
+                    'genre_comedy': np.random.randint(0, 2, num_items),
+                    'genre_drama': np.random.randint(0, 2, num_items),
+                    'genre_thriller': np.random.randint(0, 2, num_items),
+                    'genre_romance': np.random.randint(0, 2, num_items),
+                    'release_year': np.random.randint(1980, 2000, num_items),
+                    'avg_rating': movie_stats.set_index('item')['avg_rating'].reindex(range(num_items), fill_value=3.5).values,
+                    'num_ratings': movie_stats.set_index('item')['num_ratings'].reindex(range(num_items), fill_value=1).values
+                })
+
+            movie_features_df['event_timestamp'] = current_time
+            movie_features_df['created_timestamp'] = current_time
+            local_movie_path = 'data/movie_features.parquet'
+            movie_features_df.to_parquet(local_movie_path, index=False)
+            
+            upload_to_minio(s3_client, local_movie_path, 'data/movie_features.parquet')
+
+            
+            user_stats = df.groupby('user').agg({
+                'rating': ['count', 'mean', 'std'],
+                'timestamp': 'max'
+            }).round(2)
+            user_stats.columns = ['total_movies_rated', 'avg_rating_given', 'rating_std', 'last_timestamp']
+            user_stats = user_stats.reset_index()
+            user_stats['rating_std'] = user_stats['rating_std'].fillna(0)
+
+            max_timestamp = df['timestamp'].max()
+            user_stats['days_since_last_rating'] = ((max_timestamp - user_stats['last_timestamp']) // (24 * 3600)).astype(int)
+            user_stats = user_stats.drop('last_timestamp', axis=1)
+
+            genres = ['action', 'comedy', 'drama', 'thriller', 'romance']
+            user_stats['favorite_genre'] = np.random.choice(genres, size=len(user_stats)).tolist()
+
+            active_threshold = user_stats['total_movies_rated'].quantile(0.7)
+            user_stats['is_active_user'] = (user_stats['total_movies_rated'] >= active_threshold).astype(int)
+
+            user_stats['user_id'] = user_stats['user']
+            user_stats = user_stats.drop('user', axis=1)
+
+            user_stats['event_timestamp'] = current_time
+            user_stats['created_timestamp'] = current_time
+
+            local_user_path = 'data/user_interactions.parquet'
+            user_stats.to_parquet(local_user_path, index=False)
+            
+            upload_to_minio(s3_client, local_user_path, 'data/user_interactions.parquet')
+            
+            dummy_user_emb = pd.DataFrame({
+                'user_id': [0],
+                **{f'emb_{i}': [0.0] for i in range(64)},
+                'event_timestamp': [current_time],
+                'created_timestamp': [current_time]
+            })
+            local_user_emb_path = 'data/user_embeddings_dummy.parquet'
+            dummy_user_emb.to_parquet(local_user_emb_path, index=False)
+            upload_to_minio(s3_client, local_user_emb_path, 'data/user_embeddings_dummy.parquet')
+
+            dummy_movie_emb = pd.DataFrame({
+                'movie_id': [0],
+                **{f'emb_{i}': [0.0] for i in range(64)},
+                'event_timestamp': [current_time],
+                'created_timestamp': [current_time]
+            })
+            local_movie_emb_path = 'data/movie_embeddings_dummy.parquet'
+            dummy_movie_emb.to_parquet(local_movie_emb_path, index=False)
+            upload_to_minio(s3_client, local_movie_emb_path, 'data/movie_embeddings_dummy.parquet')
+
+
+            return movie_features_df, user_stats
+
+
+        def prepare_feast_data(df, num_users, num_items):
+            
+            os.makedirs('data', exist_ok=True)
+            current_time = datetime.now()
+
+            
+            movies_url = "http://files.grouplens.org/datasets/movielens/ml-100k/u.item"
+            try:
+                movie_cols = ['movie_id', 'title', 'release_date', 'video_release_date', 'imdb_url'] + \
+                            [f'genre_{i}' for i in range(19)]  
+                
+                movies_df = pd.read_csv(movies_url, sep='|', names=movie_cols, encoding='latin-1')
+                
+                movies_df['movie_id'] -= 1
+
+                unique_items_in_df = df['item'].unique()
+                item_map = {orig_id: idx for idx, orig_id in enumerate(sorted(unique_items_in_df))}
+                
+                reverse_item_map = {v: k for k, v in item_map.items()}
+                movies_df = movies_df[movies_df['movie_id'].isin(reverse_item_map.keys())]
+                movies_df['movie_id'] = movies_df['movie_id'].map({k: v for k, v in item_map.items()})
+
+                movies_df['release_year'] = pd.to_datetime(movies_df['release_date'], errors='coerce').dt.year
+                movies_df['release_year'] = movies_df['release_year'].fillna(1995).astype(int)
+
+                movie_stats = df.groupby('item')['rating'].agg(['mean', 'count']).round(2)
+                movie_stats.columns = ['avg_rating', 'num_ratings']
+                movie_stats = movie_stats.reset_index()
+
+                genre_cols = ['genre_0', 'genre_1', 'genre_2', 'genre_3', 'genre_4']
+                genre_names = ['genre_action', 'genre_comedy', 'genre_drama', 'genre_thriller', 'genre_romance']
+                
+                movie_features_df = movies_df[['movie_id'] + genre_cols + ['release_year']].copy()
+                movie_features_df.columns = ['movie_id'] + genre_names + ['release_year']
+
+                movie_features_df = movie_features_df.merge(movie_stats, left_on='movie_id', right_on='item', how='left')
+                movie_features_df = movie_features_df.drop('item', axis=1)
+                movie_features_df = movie_features_df.fillna({'avg_rating': 3.5, 'num_ratings': 1})
+
+            except Exception as e:
+                
+                movie_stats = df.groupby('item')['rating'].agg(['mean', 'count']).round(2)
+                movie_stats.columns = ['avg_rating', 'num_ratings']
+                movie_stats = movie_stats.reset_index()
+
+                movie_features_df = pd.DataFrame({
+                    'movie_id': range(num_items),
+                    'genre_action': np.random.randint(0, 2, num_items),
+                    'genre_comedy': np.random.randint(0, 2, num_items),
+                    'genre_drama': np.random.randint(0, 2, num_items),
+                    'genre_thriller': np.random.randint(0, 2, num_items),
+                    'genre_romance': np.random.randint(0, 2, num_items),
+                    'release_year': np.random.randint(1980, 2000, num_items),
+                    'avg_rating': movie_stats.set_index('item')['avg_rating'].reindex(range(num_items), fill_value=3.5).values,
+                    'num_ratings': movie_stats.set_index('item')['num_ratings'].reindex(range(num_items), fill_value=1).values
+                })
+
+            movie_features_df['event_timestamp'] = current_time
+            movie_features_df['created_timestamp'] = current_time
+            movie_features_df.to_parquet('data/movie_features.parquet', index=False)
+
+            user_stats = df.groupby('user').agg({
+                'rating': ['count', 'mean', 'std'],
+                'timestamp': 'max'
+            }).round(2)
+            user_stats.columns = ['total_movies_rated', 'avg_rating_given', 'rating_std', 'last_timestamp']
+            user_stats = user_stats.reset_index()
+            user_stats['rating_std'] = user_stats['rating_std'].fillna(0) 
+
+            max_timestamp = df['timestamp'].max()
+            user_stats['days_since_last_rating'] = ((max_timestamp - user_stats['last_timestamp']) // (24 * 3600)).astype(int)
+            user_stats = user_stats.drop('last_timestamp', axis=1)
+
+            genres = ['action', 'comedy', 'drama', 'thriller', 'romance']
+            user_stats['favorite_genre'] = np.random.choice(genres, size=len(user_stats)).tolist()
+
+            active_threshold = user_stats['total_movies_rated'].quantile(0.7)
+            user_stats['is_active_user'] = (user_stats['total_movies_rated'] >= active_threshold).astype(int)
+
+            user_stats['user_id'] = user_stats['user']
+            user_stats = user_stats.drop('user', axis=1)
+
+            user_stats['event_timestamp'] = current_time
+            user_stats['created_timestamp'] = current_time
+
+            user_stats.to_parquet('data/user_interactions.parquet', index=False)
+            
+            dummy_user_emb = pd.DataFrame({
+                'user_id': [0],
+                **{f'emb_{i}': [0.0] for i in range(64)},
+                'event_timestamp': [current_time],
+                'created_timestamp': [current_time]
+            })
+            dummy_user_emb.to_parquet('data/user_embeddings_dummy.parquet', index=False)
+
+            dummy_movie_emb = pd.DataFrame({
+                'movie_id': [0],
+                **{f'emb_{i}': [0.0] for i in range(64)},
+                'event_timestamp': [current_time],
+                'created_timestamp': [current_time]
+            })
+            dummy_movie_emb.to_parquet('data/movie_embeddings_dummy.parquet', index=False)
+
+
+            return movie_features_df, user_stats
+
+
+        def save_embeddings_to_feast(model, data_loader, store):
+            try:
+                import pandas as pd
+                from datetime import datetime
+                
+                model.eval()
+                with torch.no_grad():
+                    users_emb, items_emb = model(data_loader.train_interactions)
+                    users_emb_np = users_emb.cpu().numpy()
+                    items_emb_np = items_emb.cpu().numpy()
+
+                    current_time = datetime.now()
+
+                    max_users = min(100, len(users_emb_np))
+                    user_emb_data = []
+                    for user_id in range(max_users):
+                        row = {
+                            'user_id': int(user_id),
+                            'event_timestamp': current_time,      
+                            'created_timestamp': current_time,    
+                        }
+                        for i in range(64):
+                            row[f'emb_{i}'] = float(users_emb_np[user_id][i])
+                        user_emb_data.append(row)
+                    user_emb_df = pd.DataFrame(user_emb_data)
+
+                    max_movies = min(100, len(items_emb_np))
+                    movie_emb_data = []
+                    for movie_id in range(max_movies):
+                        row = {
+                            'movie_id': int(movie_id),
+                            'event_timestamp': current_time,     
+                            'created_timestamp': current_time,   
+                        }
+                        for i in range(64):
+                            row[f'emb_{i}'] = float(items_emb_np[movie_id][i])
+                        movie_emb_data.append(row)
+                    movie_emb_df = pd.DataFrame(movie_emb_data)
+
+                    store.push("user_embeddings_source", user_emb_df)  
+
+                    store.push("movie_embeddings_source", movie_emb_df)  
+
+
+            except Exception as e:
+                raise
+
+
+        def get_recommendations_from_feast(store, user_id, k=10, max_movies=100):
+            
+            try:
+                user_entity_df = pd.DataFrame({'user_id': [user_id]})
+                
+                user_features = store.get_online_features(
+                    features=[f"user_embeddings:emb_{i}" for i in range(64)],
+                    entity_rows=user_entity_df.to_dict('records')
+                ).to_df()
+                
+                if len(user_features) == 0:
+                    return []
+                    
+                embedding_cols = [f'emb_{i}' for i in range(64)]
+                if user_features[embedding_cols].isna().any().any():
+                    return []
+                
+                user_emb = np.array([user_features.iloc[0][f'emb_{i}'] for i in range(64)])
+                
+                movie_ids = list(range(min(max_movies, 50)))  
+                movie_entity_df = pd.DataFrame({'movie_id': movie_ids})
+                
+                movie_features = store.get_online_features(
+                    features=[f"movie_embeddings:emb_{i}" for i in range(64)],
+                    entity_rows=movie_entity_df.to_dict('records')
+                ).to_df()
+                
+                if len(movie_features) == 0:
+                    return []
+                
+                recommendations = []
+                
+                for _, row in movie_features.iterrows():
+                    movie_id = row['movie_id']
+                    
+                    movie_emb_values = [row[f'emb_{i}'] for i in range(64)]
+                    if pd.isna(movie_emb_values).any():
+                        continue
+                        
+                    movie_emb = np.array(movie_emb_values)
+                    
+                    user_norm = np.linalg.norm(user_emb)
+                    movie_norm = np.linalg.norm(movie_emb)
+                    
+                    if user_norm > 0 and movie_norm > 0:
+                        score = np.dot(user_emb, movie_emb) / (user_norm * movie_norm)
+                        recommendations.append((movie_id, float(score)))
+                
+                recommendations.sort(key=lambda x: x[1], reverse=True)
+                
+                return recommendations[:k]
+                
+            except Exception as e:
+                return []
+
+        def setup_feast_for_lightgcn():
+            
+            try:
+                store = FeatureStore(repo_path=".")
+                
+                store.apply([
+                    user_entity, movie_entity,
+                    movie_features, user_interaction_stats,
+                    user_embeddings, movie_embeddings,
+                    user_embeddings_push_source, movie_embeddings_push_source
+                ])
+                
+                try:
+                    end_date = datetime.now()
+                    start_date = end_date - timedelta(days=1)
+                    
+                    
+                    store.materialize(
+                        feature_views=[movie_features.name, user_interaction_stats.name],
+                        start_date=start_date, 
+                        end_date=end_date
+                    )
+                    
+                except Exception as e:
+                    print("Materialization failed")
+                return store
+                
+            except Exception as e:
+                raise
+
+
+
+        class LightGCN(nn.Module):
+            def __init__(self, n_users, n_items, embedding_dim=64, n_layers=3):
+                super(LightGCN, self).__init__()
+
+                self.n_users = n_users
+                self.n_items = n_items
+                self.embedding_dim = embedding_dim
+                self.n_layers = n_layers
+
+                self.user_embeddings = nn.Embedding(n_users, embedding_dim)
+                self.item_embeddings = nn.Embedding(n_items, embedding_dim)
+
+                nn.init.xavier_uniform_(self.user_embeddings.weight)
+                nn.init.xavier_uniform_(self.item_embeddings.weight)
+
+                self.Graph = None
+                self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                self.to(self.device)
+
+            def create_bipartite_graph(self, interactions):
+
+                n_nodes = self.n_users + self.n_items
+
+                edge_list = []
+                for user_id, item_id in interactions:
+                    edge_list.append([user_id, self.n_users + item_id])
+                    edge_list.append([self.n_users + item_id, user_id])
+
+                edges = torch.tensor(edge_list, dtype=torch.long).t()
+
+                adj_mat = torch.sparse_coo_tensor(
+                    edges,
+                    torch.ones(edges.shape[1]),
+                    (n_nodes, n_nodes),
+                    dtype=torch.float
+                ).coalesce()
+
+                row_sum = torch.sparse.sum(adj_mat, dim=1).to_dense()
+                d_inv_sqrt = torch.pow(row_sum, -0.5)
+                d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.
+
+                indices = adj_mat.indices()
+                values = adj_mat.values()
+                normalized_values = d_inv_sqrt[indices[0]] * values * d_inv_sqrt[indices[1]]
+
+                norm_adj = torch.sparse_coo_tensor(
+                    indices,
+                    normalized_values,
+                    adj_mat.size(),
+                    dtype=torch.float
+                ).coalesce()
+
+                return norm_adj.to(self.device)
+
+            def forward(self, interactions):
+                if self.Graph is None:
+                    self.Graph = self.create_bipartite_graph(interactions)
+
+                users_emb = self.user_embeddings.weight
+                items_emb = self.item_embeddings.weight
+                all_emb = torch.cat([users_emb, items_emb], dim=0)
+
+                embs = [all_emb]
+
+                for layer in range(self.n_layers):
+                    all_emb = torch.sparse.mm(self.Graph, all_emb)
+                    embs.append(all_emb)
+
+                embs = torch.stack(embs, dim=1)
+                final_emb = torch.mean(embs, dim=1)
+
+                users_emb = final_emb[:self.n_users]
+                items_emb = final_emb[self.n_users:]
+
+                return users_emb, items_emb
+
+            def predict(self, users_emb, items_emb, user_ids, item_ids):
+                user_emb = users_emb[user_ids]
+                item_emb = items_emb[item_ids]
+                scores = torch.sum(user_emb * item_emb, dim=1)
+                return scores
+
+        class MovieLensDataLoader:
+            def __init__(self, min_rating=4, test_size=0.2):
+                self.df, self.n_users, self.n_items = load_movielens_100k(min_rating)
+                self.prepare_data(test_size)
+
+            def prepare_data(self, test_size=0.2):
+                self.df = self.df.sort_values('timestamp')
+
+                train_data = []
+                test_data = []
+
+                for user_id in self.df['user'].unique():
+                    user_interactions = self.df[self.df['user'] == user_id]
+
+                    if len(user_interactions) < 2:
+                        train_data.append(user_interactions)
+                    else:
+                        n_test = max(1, int(len(user_interactions) * test_size))
+                        test_data.append(user_interactions.tail(n_test))
+                        train_data.append(user_interactions.head(-n_test))
+
+                self.train_df = pd.concat(train_data, ignore_index=True)
+                self.test_df = pd.concat(test_data, ignore_index=True)
+
+                self.train_interactions = set(zip(self.train_df['user'], self.train_df['item']))
+                self.test_interactions = set(zip(self.test_df['user'], self.test_df['item']))
+
+        class BPRLoss(nn.Module):
+            def __init__(self):
+                super(BPRLoss, self).__init__()
+
+            def forward(self, pos_scores, neg_scores):
+                loss = -torch.log(torch.sigmoid(pos_scores - neg_scores) + 1e-8)
+                return torch.mean(loss)
+
+        def negative_sampling_batch(train_interactions, n_users, n_items, batch_size=1024):
+            pos_samples = list(train_interactions)
+            
+            user_items = defaultdict(set)
+            for user_id, item_id in pos_samples:
+                user_items[user_id].add(item_id)
+
+            batches = []
+            for i in range(0, len(pos_samples), batch_size):
+                batch_pos = pos_samples[i:i + batch_size]
+                batch_neg = []
+
+                for user_id, _ in batch_pos:
+                    user_pos_items = user_items[user_id]
+                    while True:
+                        neg_item = random.randint(0, n_items - 1)
+                        if neg_item not in user_pos_items:
+                            batch_neg.append((user_id, neg_item))
+                            break
+
+                batches.append((batch_pos, batch_neg))
+
+            return batches
+
+        def train_lightgcn_with_feast(model, data_loader, store, epochs=50, lr=0.001, 
+                                    weight_decay=1e-4, batch_size=2048, eval_every=10,
+                                    save_embeddings_every=20):
+
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+            bpr_loss = BPRLoss()
+
+            device = model.device
+            train_interactions = data_loader.train_interactions
+
+            losses = []
+            recall_scores = []
+            ndcg_scores = []
+
+
+            for epoch in range(epochs):
+                model.train()
+                epoch_loss = 0
+                n_batches = 0
+
+                batches = negative_sampling_batch(
+                    train_interactions,
+                    data_loader.n_users,
+                    data_loader.n_items,
+                    batch_size
+                )
+
+                for pos_batch, neg_batch in batches:
+                    pos_users = torch.tensor([x[0] for x in pos_batch], dtype=torch.long, device=device)
+                    pos_items = torch.tensor([x[1] for x in pos_batch], dtype=torch.long, device=device)
+                    neg_users = torch.tensor([x[0] for x in neg_batch], dtype=torch.long, device=device)
+                    neg_items = torch.tensor([x[1] for x in neg_batch], dtype=torch.long, device=device)
+
+                    users_emb, items_emb = model(train_interactions)
+
+                    pos_scores = model.predict(users_emb, items_emb, pos_users, pos_items)
+                    neg_scores = model.predict(users_emb, items_emb, neg_users, neg_items)
+
+                    loss = bpr_loss(pos_scores, neg_scores)
+                    reg_loss = (torch.norm(users_emb[pos_users]) + torch.norm(items_emb[pos_items])) / len(pos_users)
+                    total_loss = loss + weight_decay * reg_loss
+
+                    optimizer.zero_grad()
+                    total_loss.backward()
+                    optimizer.step()
+
+                    epoch_loss += loss.item()
+                    n_batches += 1
+
+                avg_loss = epoch_loss / n_batches
+                losses.append(avg_loss)
+
+                if epoch % eval_every == 0 or epoch == epochs - 1:
+                    recall, ndcg = evaluate_model(model, data_loader, k=20)
+                    recall_scores.append(recall)
+                    ndcg_scores.append(ndcg)
+                    if epoch % save_embeddings_every == 0 and epoch > 0:
+                        try:
+                            save_embeddings_to_feast(model, data_loader, store)
+                        except Exception as e:
+                            print("Failed to save embeddings to Feast")
+                            
+                elif epoch % 5 == 0:
+                    print("line 668")
+
+            save_embeddings_to_feast(model, data_loader, store)
+
+            return losses, recall_scores, ndcg_scores
+
+        def evaluate_model(model, data_loader, k=20):
+            model.eval()
+            device = model.device
+
+            with torch.no_grad():
+                users_emb, items_emb = model(data_loader.train_interactions)
+
+                recalls = []
+                ndcgs = []
+
+                test_by_user = defaultdict(list)
+                for user_id, item_id in data_loader.test_interactions:
+                    test_by_user[user_id].append(item_id)
+
+                train_by_user = defaultdict(set)
+                for user_id, item_id in data_loader.train_interactions:
+                    train_by_user[user_id].add(item_id)
+
+                for user_id, test_items in test_by_user.items():
+                    if len(test_items) == 0:
+                        continue
+
+                    user_emb = users_emb[user_id:user_id+1]
+                    all_item_scores = torch.mm(user_emb, items_emb.t()).squeeze()
+
+                    train_items = train_by_user[user_id]
+                    for item in train_items:
+                        all_item_scores[item] = -float('inf')
+
+                    _, top_items = torch.topk(all_item_scores, k)
+                    top_items = top_items.cpu().numpy().tolist()
+
+                    hits = len(set(top_items) & set(test_items))
+                    recall = hits / len(test_items)
+                    recalls.append(recall)
+
+                    dcg = sum([1 / np.log2(i + 2) for i, item in enumerate(top_items) if item in test_items])
+                    idcg = sum([1 / np.log2(i + 2) for i in range(min(len(test_items), k))])
+                    ndcg = dcg / idcg if idcg > 0 else 0
+                    ndcgs.append(ndcg)
+
+            return np.mean(recalls), np.mean(ndcgs)
+
+        def demo_feast_recommendations(store, data_loader, num_examples=5):
+
+            
+            available_users = list(range(min(50, data_loader.n_users))) 
+            demo_users = random.sample(available_users, min(num_examples, len(available_users)))
+            
+            for user_id in demo_users:
+                
+                try:
+                    recommendations = get_recommendations_from_feast(store, user_id, k=5)
+                    
+                    if recommendations:
+                        for i, (movie_id, score) in enumerate(recommendations):
+                            print("movieId")
+                            
+                        user_train_items = [item for u, item in data_loader.train_interactions if u == user_id]
+                    else:
+                        print("No recommendations available")
+                        
+                except Exception as e:
+                    print("Error fetching recommendations")
+
+
+
+        def main_with_feast():
+            
+            data_loader = MovieLensDataLoader(min_rating=4, test_size=0.2)
+            
+            movie_features_df, user_stats_df = prepare_feast_data_with_s3(
+                data_loader.df, data_loader.n_users, data_loader.n_items
+            )
+
+            store = setup_feast_for_lightgcn()
+
+            model = LightGCN(
+                n_users=data_loader.n_users,
+                n_items=data_loader.n_items,
+                embedding_dim=64,
+                n_layers=3
+            )
+
+            losses, recall_scores, ndcg_scores = train_lightgcn_with_feast(
+                model=model,
+                data_loader=data_loader,
+                store=store,
+                epochs=30,
+                lr=0.001,
+                weight_decay=1e-4,
+                batch_size=1024,
+                eval_every=10,
+                save_embeddings_every=15
+            )
+
+            demo_feast_recommendations(store, data_loader, num_examples=3)
+
+            compare_recommendations(model, data_loader, store, user_id=0)
+
+
+            return model, data_loader, store
+
+
+
+        def compare_recommendations(model, data_loader, store, user_id=0):
+            
+            model.eval()
+            with torch.no_grad():
+                users_emb, items_emb = model(data_loader.train_interactions)
+                user_emb = users_emb[user_id:user_id+1]
+                all_scores = torch.mm(user_emb, items_emb.t()).squeeze()
+                
+                train_items = [item for u, item in data_loader.train_interactions if u == user_id]
+                for item in train_items:
+                    all_scores[item] = -float('inf')
+                    
+                _, top_items_direct = torch.topk(all_scores, 5)
+                top_scores_direct = all_scores[top_items_direct].cpu().numpy()
+                top_items_direct = top_items_direct.cpu().numpy()
+            
+            feast_recs = get_recommendations_from_feast(store, user_id, k=5)
+            
+            
+            for i in range(5):
+                direct = f"Movie {int(top_items_direct[i]):3d} ({top_scores_direct[i]:.3f})"
+                feast = f"Movie {int(feast_recs[i][0]):3d} ({feast_recs[i][1]:.3f})" if i < len(feast_recs) else "N/A"
+
+        if __name__ == "__main__":
+            model, data_loader, store = main_with_feast()
+            
+
+
+        import os
+
+        os.environ.setdefault("AWS_ACCESS_KEY_ID", "root")
+        os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "gaianmobius")
+        os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
+        os.environ.setdefault("AWS_S3_ENDPOINT_URL", "http://minio.feast.svc.cluster.local:9000") 
+        os.environ.setdefault("AWS_S3_ALLOW_HTTP", "true")
+        os.environ.setdefault("AWS_S3_FORCE_PATH_STYLE", "true")
+
+        import sys
+        from datetime import datetime
+
+        def run_complete_demo():
+            
+            
+            try:
+                from lightgcn_with_feast import main_with_feast
+                
+                model, data_loader, store = main_with_feast()
+                
+                
+                return model, data_loader, store
+                
+            except ImportError as e:
+                return None, None, None
+                
+            except Exception as e:
+                return None, None, None
+
+        def quick_recommendation_test(store):
+            if store is None:
+                print(" Store not available")
+                return
+                
+            
+            try:
+                from lightgcn_with_feast import get_recommendations_from_feast
+                
+                test_users = [0, 1, 2]
+                
+                for user_id in test_users:
+                    recs = get_recommendations_from_feast(store, user_id, k=3)
+                    
+                    if recs:
+                        for i, (movie_id, score) in enumerate(recs):
+                            print("movieId")
+                    else:
+                        print("   No recommendations available")
+                        
+            except Exception as e:
+                print(" Test failed")
+
+        if __name__ == "__main__":
+            print(" Starting LightGCN + Feast + MinIO demo...")
+            
+            try:
+                import torch
+                import feast
+            except ImportError as e:
+                print(" Missing dependencies")
+                sys.exit(1)
+            
+            model, data_loader, store = run_complete_demo()
+            
+            if store is not None:
+                quick_recommendation_test(store)
+                
+                print("from lightgcn_with_feast import get_recommendations_from_feast")
+            else:
+                print(" Demo setup failed. Check the errors above.")
+
+
+
+
+
+    args:
+      - --upload_to_minio
+      - {inputValue: upload_to_minio}
+      - --materialize
+      - {inputValue: materialize}
+      - --apply
+      - {inputValue: apply}
