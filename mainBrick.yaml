@@ -3,8 +3,6 @@ description: Generates using user-provided bricks.
 
 inputs:
   - {name: upload_to_minio, type: string}      
-  - {name: materialize, type: string}         
-  - {name: apply, type: string}    
 
 
 implementation:
@@ -884,7 +882,3 @@ implementation:
     args:
       - --upload_to_minio
       - {inputValue: upload_to_minio}
-      - --materialize
-      - {inputValue: materialize}
-      - --apply
-      - {inputValue: apply}
