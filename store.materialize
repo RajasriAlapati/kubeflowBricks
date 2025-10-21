@@ -1,0 +1,138 @@
+name: materializeBrick
+description: |
+  Materializes specific Feast FeatureViews for a given schemaId between start and end dates.
+  It uses the dynamically generated feature_store.yaml and runs the Feast materialize process
+  for selected FeatureViews within the specified time range.
+
+inputs:
+  - {name: usecase, type: string, description: "Usecase for Feast."}
+  - {name: schemaId, type: string, description: "Schema ID to identify FeatureViews to materialize."}
+  - {name: domain, type: string, description: "Domain name related to the schema."}
+  - {name: token, type: string, description: "Bearer token for PI API authentication."}
+  - {name: connection_string, type: string, description: "Redis connection string (e.g., redis.feast.svc.cluster.local:6379)."}
+  - {name: registry_path, type: string, description: "Postgres registry path (e.g., postgresql://feast:feast@postgres.feast.svc.cluster.local:5432/feast)."}
+  - {name: start_date, type: string, description: "Start date for materialization (YYYY-MM-DD)."}
+  - {name: end_date, type: string, description: "End date for materialization (YYYY-MM-DD)."}
+
+outputs:
+  - {name: result, type: String, description: "Status message from Feast materialize operation."}
+
+implementation:
+  container:
+    image: python:3.10
+    command:
+      - sh
+      - -c
+      - (PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet feast[redis]==0.49.0 requests psycopg \
+        || PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet feast[redis]==0.49.0 requests psycopg --user) \
+        && "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import os, json, requests
+        from feast import FeatureStore
+        from datetime import datetime
+
+        def generate_feature_store_yaml(connection_string, registry_path):
+            return f'''
+              project: movie_recommendation_lightgcn
+              provider: local
+              offline_store:
+                type: file
+              online_store:
+                type: redis
+                connection_string: {connection_string}
+              registry:
+                path: {registry_path}
+                registry_type: sql
+                cache_ttl_seconds: 60
+                sqlalchemy_config_kwargs:
+                  echo: false
+                  pool_pre_ping: true
+              entity_key_serialization_version: 3
+              '''
+
+        def fetch_featureviews(domain, schema_id, token, usecase=""):
+            url = f"{domain}/pi-entity-instances-service/v2.0/schemas/{schema_id}/instances/list"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            payload = {
+                "dbType": "TIDB",
+                "filter": {"type": "featureview", "usecase": usecase},
+                "page": 0, "size": 100,
+                "showDBaaSReservedKeywords": "false"
+            }
+            resp = requests.post(url, headers=headers, json=payload)
+            if resp.status_code != 200:
+                raise Exception(f"Failed to fetch FeatureViews: {resp.status_code} - {resp.text}")
+            data = resp.json()
+            featureviews = [item.get("payload", {}).get("name") for item in data if item.get("payload")]
+            print(f"FeatureViews to materialize: {featureviews}")
+            return featureviews
+
+        if __name__ == "__main__":
+            import argparse
+            parser = argparse.ArgumentParser(description="Materialize Feast FeatureViews for a schemaId")
+            parser.add_argument("--usecase", required=True)
+            parser.add_argument("--schemaId", required=True)
+            parser.add_argument("--domain", required=True)
+            parser.add_argument("--token", required=True)
+            parser.add_argument("--output", dest="output_path", required=True)
+            parser.add_argument("--connection_string", required=True)
+            parser.add_argument("--registry_path", required=True)
+            parser.add_argument("--start_date", required=True)
+            parser.add_argument("--end_date", required=True)
+            args = parser.parse_args()
+
+            FEATURE_STORE_YAML = generate_feature_store_yaml(args.connection_string, args.registry_path)
+            with open("feature_store.yaml", "w") as fh:
+                fh.write(FEATURE_STORE_YAML)
+            print("feature_store.yaml written successfully with user-provided connection details.")
+
+            try:
+                print(f"Fetching FeatureViews for schemaId: {args.schemaId}")
+                featureview_names = fetch_featureviews(args.domain, args.schemaId, args.token, usecase=args.usecase)
+
+                store = FeatureStore(repo_path=".")
+                start_date = datetime.strptime(args.start_date, "%Y-%m-%d")
+                end_date = datetime.strptime(args.end_date, "%Y-%m-%d")
+
+                print(f"Materializing FeatureViews from {start_date} to {end_date}...")
+                store.materialize(
+                    feature_views=featureview_names,
+                    start_date=start_date,
+                    end_date=end_date
+                )
+
+                message = f"✅ Successfully materialized FeatureViews: {featureview_names}"
+                print(message)
+                os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
+                with open(args.output_path, "w") as f:
+                    f.write(message)
+
+            except Exception as e:
+                err = f"❌ Error during materialization for schemaId={args.schemaId}: {e}"
+                print(err)
+                os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
+                with open(args.output_path, "w") as f:
+                    f.write(err)
+
+    args:
+      - --usecase
+      - {inputValue: usecase}
+      - --schemaId
+      - {inputValue: schemaId}
+      - --domain
+      - {inputValue: domain}
+      - --token
+      - {inputValue: token}
+      - --connection_string
+      - {inputValue: connection_string}
+      - --registry_path
+      - {inputValue: registry_path}
+      - --start_date
+      - {inputValue: start_date}
+      - --end_date
+      - {inputValue: end_date}
+      - --output
+      - {outputPath: result}
