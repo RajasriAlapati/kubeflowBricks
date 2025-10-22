@@ -1,0 +1,156 @@
+name: applyBrick
+description: |
+  Fetches all Feast FeatureViews and Entities for a given schemaId from PI API,
+  dynamically generates a feature_store.yaml with user-provided connection details,
+  and applies them locally using Feast FeatureStore.
+
+inputs:
+  - {name: usecase, type: string, description: "Usecase for Feast."}
+  - {name: schemaId, type: string, description: "Schema ID to identify FeatureView pairs."}
+  - {name: domain, type: string, description: "Domain name related to the schema."}
+  - {name: token, type: string, description: "Bearer token for PI API authentication."}
+  - {name: connection_string, type: string, description: "Redis connection string (e.g., redis.feast.svc.cluster.local:6379)."}
+  - {name: registry_path, type: string, description: "Postgres registry path (e.g., postgresql://feast:feast@postgres.feast.svc.cluster.local:5432/feast)."}
+
+outputs:
+  - {name: result, type: String, description: "Status message from Feast apply operation."}
+
+implementation:
+  container:
+    image: python:3.10
+    command:
+      - sh
+      - -c
+      - (PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet feast[redis]==0.49.0 requests psycopg \
+        || PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet feast[redis]==0.49.0 requests psycopg --user) \
+        && "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import os, json, requests
+        from feast import FeatureView, FeatureStore
+        from google.protobuf.json_format import Parse
+        from feast.protos.feast.core import FeatureView_pb2
+        from datetime import datetime, timedelta
+
+        def generate_feature_store_yaml(connection_string, registry_path):
+            return f'''
+              project: movie_recommendation_lightgcn
+              provider: local
+              offline_store:
+                type: file
+              online_store:
+                type: redis
+                connection_string: {connection_string}
+              registry:
+                path: {registry_path}
+                registry_type: sql
+                cache_ttl_seconds: 60
+                sqlalchemy_config_kwargs:
+                  echo: false
+                  pool_pre_ping: true
+              entity_key_serialization_version: 3
+              '''
+
+        def fetch_instances(domain, schema_id, token, filter_type="featureview", usecase=""):
+            url = f"{domain}/pi-entity-instances-service/v2.0/schemas/{schema_id}/instances/list"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
+            params = {
+                "page": 0,
+                "size": 100,
+                "showDBaaSReservedKeywords": "false"
+            }
+            payload = {
+                "dbType": "TIDB",
+                "entityId": "",
+                "entityIds": [],
+                "ownedOnly": False,
+                "projections": [],
+                "filter": {"type": filter_type, "usecase": usecase},
+                "startTime": 0,
+                "endTime": 0
+            }
+            try:
+                print(f"Request Payload: {json.dumps(payload, indent=2)}")
+                resp = requests.post(url, headers=headers, params=params, json=payload)
+                if resp.status_code != 200:
+                    raise Exception(f"Failed to fetch FeatureViews: {resp.status_code} - {resp.text}")
+                data = resp.json()
+                print(f"Response Data: {json.dumps(data, indent=2)}")
+                return [item.get("payload", {}) for item in data]
+            except Exception as e:
+                raise Exception(f"Failed to fetch FeatureViews: {e}")
+
+        def apply_feature(featureview_instances, entity_instances):
+            store = FeatureStore(repo_path=".")
+            fvs = featureview_instances + entity_instances
+            if not fvs:
+                raise ValueError("No FeatureViews found to apply.")
+            store.apply(fvs)
+            return store
+
+        if __name__ == "__main__":
+            import argparse
+            parser = argparse.ArgumentParser(description="Apply Feast FeatureViews by schemaId")
+            parser.add_argument("--usecase", required=True)
+            parser.add_argument("--schemaId", required=True)
+            parser.add_argument("--domain", required=True)
+            parser.add_argument("--token", required=True)
+            parser.add_argument("--output", dest="output_path", required=True)
+            parser.add_argument("--connection_string", required=True, help="Redis connection string (e.g., redis.feast.svc.cluster.local:6379)")
+            parser.add_argument("--registry_path", required=True, help="Postgres registry path (e.g., postgresql://feast:feast@postgres.feast.svc.cluster.local:5432/feast)")
+            args = parser.parse_args()
+
+            FEATURE_STORE_YAML = generate_feature_store_yaml(args.connection_string, args.registry_path)
+            with open("feature_store.yaml", "w") as fh:
+                fh.write(FEATURE_STORE_YAML)
+                fh.flush()
+                os.fsync(fh.fileno())
+            print("feature_store.yaml written successfully with user-provided connection details.")
+
+            try:
+                print(f"Fetching FeatureViews for schemaId: {args.schemaId}")
+                featureview_instances = fetch_instances(
+                    args.domain, args.schemaId, args.token, filter_type="featureview", usecase=args.usecase
+                )
+                print(f"Found {len(featureview_instances)} FeatureView instances.")
+
+                entity_instances = fetch_instances(
+                    args.domain, args.schemaId, args.token, filter_type="entity", usecase=args.usecase
+                )
+                print(f"Found {len(entity_instances)} Entity instances.")
+
+                store = apply_feature(featureview_instances, entity_instances)
+                print("FeatureViews applied successfully.")
+                print(store)
+
+                os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
+                with open(args.output_path, "w") as f:
+                    f.write(str(store))
+
+            except Exception as e:
+                err = f"Error applying Feast schemaId={args.schemaId}: {e}"
+                print(err)
+                os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
+                with open(args.output_path, "w") as f:
+                    f.write(err)
+
+    args:
+      - --usecase
+      - {inputValue: usecase}
+      - --schemaId
+      - {inputValue: schemaId}
+      - --domain
+      - {inputValue: domain}
+      - --token
+      - {inputValue: token}
+      - --connection_string
+      - {inputValue: connection_string}
+      - --registry_path
+      - {inputValue: registry_path}
+      - --output
+      - {outputPath: result}
