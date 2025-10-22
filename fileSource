@@ -1,0 +1,80 @@
+name: new_file_source
+description: Creates a Feast FileSource JSON file from name, path, timestamp field, and optional created timestamp column.
+
+inputs:
+- {name: name, type: String, description: "The name of the Feast FileSource."}
+- {name: path, type: String, description: "Path to the data file (e.g., parquet/csv)."}
+- {name: timestamp_field, type: String, description: "Column for event timestamp."}
+- {name: created_timestamp_column, type: String, description: "Column for created timestamp.", optional: true}
+
+outputs:
+- {name: output, type: JsonObject, description: "The generated Feast FileSource in JSON format."}
+
+implementation:
+  container:
+    image: python:3.10
+    command:
+    - sh
+    - -c
+    - (PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location 'feast==0.49.0' \
+       || PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location 'feast==0.49.0' --user) \
+       && "$0" "$@"
+    - python3
+    - -u
+    - -c
+    - |
+      import argparse
+      import json
+      import os
+      from feast import FileSource
+      from google.protobuf.json_format import MessageToJson
+
+      def create_feast_file_source(name, path, timestamp_field, created_timestamp_column=None):
+          # Create FileSource
+          file_source = FileSource(
+              name=name,
+              path=path,
+              timestamp_field=timestamp_field,
+              created_timestamp_column=created_timestamp_column,
+          )
+
+          # Convert to protobuf -> JSON -> Python dict
+          proto = file_source.to_proto()
+          file_source_json = MessageToJson(proto, preserving_proto_field_name=True, indent=2)
+          return json.loads(file_source_json)
+
+      def _serialize_json(obj) -> str:
+          return json.dumps(obj, sort_keys=True, indent=2)
+
+      _parser = argparse.ArgumentParser(prog='new_file_source', description='Creates a Feast FileSource JSON file.')
+      _parser.add_argument("--name", dest="name", type=str, required=True)
+      _parser.add_argument("--path", dest="path", type=str, required=True)
+      _parser.add_argument("--timestamp_field", dest="timestamp_field", type=str, required=True)
+      _parser.add_argument("--created_timestamp_column", dest="created_timestamp_column", type=str, required=False, default=None)
+      _parser.add_argument("----output-paths", dest="_output_paths", type=str, nargs=1)
+
+      _parsed_args = vars(_parser.parse_args())
+      _output_files = _parsed_args.pop("_output_paths", [])
+
+      _outputs = create_feast_file_source(**_parsed_args)
+
+      _output_serializers = [_serialize_json]
+
+      for idx, output_file in enumerate(_output_files):
+          try:
+              os.makedirs(os.path.dirname(output_file), exist_ok=True)
+          except OSError:
+              pass
+          with open(output_file, 'w') as f:
+              f.write(_output_serializers[idx](_outputs))
+    args:
+    - --name
+    - {inputValue: name}
+    - --path
+    - {inputValue: path}
+    - --timestamp_field
+    - {inputValue: timestamp_field}
+    - --created_timestamp_column
+    - {inputValue: created_timestamp_column}
+    - '----output-paths'
+    - {outputPath: output}
