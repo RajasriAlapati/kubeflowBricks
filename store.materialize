@@ -104,14 +104,14 @@ implementation:
                     end_date=end_date
                 )
 
-                message = f"✅ Successfully materialized FeatureViews: {featureview_names}"
+                message = f"Successfully materialized FeatureViews: {featureview_names}"
                 print(message)
                 os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
                 with open(args.output_path, "w") as f:
                     f.write(message)
 
             except Exception as e:
-                err = f"❌ Error during materialization for schemaId={args.schemaId}: {e}"
+                err = f"Error during materialization for schemaId={args.schemaId}: {e}"
                 print(err)
                 os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
                 with open(args.output_path, "w") as f:
