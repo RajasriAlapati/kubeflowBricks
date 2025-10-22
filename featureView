@@ -1,0 +1,161 @@
+name: fv_schema
+description: Creates a Feast FeatureView JSON file from user-provided values and pushes it to PI schema service.
+
+inputs:
+  - {name: entity_json, type: JsonObject, description: "Feast Entity JSON file."}
+  - {name: source_json, type: JsonObject, description: "Feast Source JSON file."}
+  - {name: schema_json, type: JsonObject, description: "Feast Schema JSON file containing fields and dtypes."}
+  - {name: featureview_name, type: String, description: "Name of the FeatureView."}
+  - {name: ttl_days, type: String, description: "Time-to-live in days for FeatureView data."}
+  - {name: usecase, type: string, description: "Usecase based on schema."}
+  - {name: schemaId, type: string, description: "Schema ID."}
+  - {name: domain, type: string, description: "Domain name."}
+  - {name: token, type: string, description: "Bearer token for API call."}
+
+outputs:
+  - {name: output, type: JsonObject, description: "The generated Feast FeatureView JSON."}
+
+implementation:
+  container:
+    image: python:3.10
+    command:
+    - sh
+    - -c
+    - (PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location 'feast==0.49.0' \
+       || PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location 'feast==0.49.0' --user) \
+       && "$0" "$@"
+    - python3
+    - -u
+    - -c
+    - |
+      import argparse, json, os, requests
+      from datetime import timedelta
+      from feast import Entity, FileSource, FeatureView, Field
+      from feast.types import Int64, Float64, String
+      from google.protobuf.json_format import MessageToJson, Parse
+      from feast.protos.feast.core import Entity_pb2, DataSource_pb2
+
+      TYPE_MAP = {
+          "INT64": Int64,
+          "FLOAT64": Float64,
+          "STRING": String,
+      }
+
+      def _serialize_json(obj) -> str:
+          return json.dumps(obj, sort_keys=True, indent=2)
+
+      def _make_parent_dirs_and_return_path(file_path: str):
+          os.makedirs(os.path.dirname(file_path), exist_ok=True)
+          return file_path
+
+      parser = argparse.ArgumentParser(description="Create Feast FeatureView JSON and upload to schema service.")
+      parser.add_argument("--entity_json", required=True)
+      parser.add_argument("--source_json", required=True)
+      parser.add_argument("--schema_json", required=True)
+      parser.add_argument("--featureview_name", required=True)
+      parser.add_argument("--ttl_days", required=True)
+      parser.add_argument("--usecase", required=True)
+      parser.add_argument("--schemaId", required=True)
+      parser.add_argument("--domain", required=True)
+      parser.add_argument("--token", required=True)
+      parser.add_argument("--output", dest="output_path", type=_make_parent_dirs_and_return_path, required=True)
+      args = parser.parse_args()
+
+      # ----------------------------
+      # Load Entity
+      # ----------------------------
+      with open(args.entity_json) as f:
+          entity_json_full = json.load(f)
+      entity_proto = Parse(json.dumps(entity_json_full), Entity_pb2.Entity())
+      entity_obj = Entity.from_proto(entity_proto)
+
+      # ----------------------------
+      # Load FileSource
+      # ----------------------------
+      with open(args.source_json) as f:
+          source_json_full = json.load(f)
+      source_proto = Parse(json.dumps(source_json_full), DataSource_pb2.DataSource())
+      source_obj = FileSource.from_proto(source_proto)
+
+      # ----------------------------
+      # Load Schema and Build Fields
+      # ----------------------------
+      with open(args.schema_json) as f:
+          schema_data = json.load(f)
+
+      fields = []
+      for col in schema_data:
+          dtype = col["dtype"].upper()
+          if dtype not in TYPE_MAP:
+              raise ValueError(f"Unsupported dtype: {dtype}")
+          fields.append(Field(name=col["name"], dtype=TYPE_MAP[dtype]))
+
+      # ----------------------------
+      # Create FeatureView
+      # ----------------------------
+      fv = FeatureView(
+          name=args.featureview_name,
+          entities=[entity_obj],
+          ttl=timedelta(days=int(args.ttl_days)),
+          schema=fields,
+          source=source_obj,
+      )
+
+      proto = fv.to_proto()
+      feature_view_json = json.loads(MessageToJson(proto, preserving_proto_field_name=True, indent=2))
+
+      # ----------------------------
+      # Save to output file
+      # ----------------------------
+      with open(args.output_path, "w") as f:
+          f.write(_serialize_json(feature_view_json))
+      print(f"FeatureView '{fv.name}' dumped to {args.output_path}")
+
+      # ----------------------------
+      # Send to PI API
+      # ----------------------------
+      url = f"https://igs.gov-cloud.ai/pi-entity-instances-service/v2.0/schemas/{args.schemaId}/instances"
+      payload = {
+          "data": [
+              {
+                  "usecase": args.usecase,
+                  "type": "featureview",
+                  "name": args.featureview_name,
+                  "payload": feature_view_json
+              }
+          ]
+      }
+
+      headers = {
+          "Authorization": f"Bearer {args.token}",
+          "Content-Type": "application/json"
+      }
+
+      try:
+          response = requests.post(url, headers=headers, json=payload)
+          print("Status Code:", response.status_code)
+          print("Response:", response.text)
+      except Exception as e:
+          print("Error during API call:", str(e))
+
+    args:
+      - --entity_json
+      - {inputPath: entity_json}
+      - --source_json
+      - {inputPath: source_json}
+      - --schema_json
+      - {inputPath: schema_json}
+      - --featureview_name
+      - {inputValue: featureview_name}
+      - --ttl_days
+      - {inputValue: ttl_days}
+      - --usecase
+      - {inputValue: usecase}
+      - --schemaId
+      - {inputValue: schemaId}
+      - --domain
+      - {inputValue: domain}
+      - --token
+      - {inputValue: token}
+      - --output
+      - {outputPath: output}
