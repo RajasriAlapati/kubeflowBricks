@@ -1,0 +1,125 @@
+name: entity_schema2
+description: Creates a Feast Entity JSON file from entity name, value type, and description.
+
+inputs:
+- {name: entity_name, type: String, description: "The name of the Feast Entity."}
+- {name: value_type, type: String, description: "Entity value type (INT64, FLOAT, STRING, BOOL, BYTES)."}
+- {name: description, type: String, description: "Description for the Feast Entity.", optional: true}
+- {name: usecase, type: string, description: "Usecase based on schema."}
+- {name: schemaId, type: string, description: "Schema ID."}
+- {name: domain, type: string, description: "Domain."}
+- {name: token, type: string, description: "Bearer token for API call."}
+
+outputs:
+- {name: output, type: JsonObject, description: "The generated Feast Entity in JSON format."}
+
+implementation:
+  container:
+    image: python:3.10
+    command:
+    - sh
+    - -c
+    - (PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location 'feast==0.49.0' \
+       || PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location 'feast==0.49.0' --user) \
+       && "$0" "$@"
+    - python3
+    - -u
+    - -c
+    - |
+      import argparse
+      import json
+      import requests
+      import os
+      from feast import Entity, ValueType
+      from google.protobuf.json_format import MessageToJson
+
+      def create_feast_entity(entity_name, value_type, description=""):
+          value_type_map = {
+              "INT64": ValueType.INT64,
+              "FLOAT": ValueType.FLOAT,
+              "STRING": ValueType.STRING,
+              "BOOL": ValueType.BOOL,
+              "BYTES": ValueType.BYTES,
+          }
+
+          entity = Entity(
+              name=entity_name,
+              value_type=value_type_map[value_type],
+              description=description,
+          )
+
+          proto = entity.to_proto()
+          entity_json = MessageToJson(proto, preserving_proto_field_name=True, indent=2)
+          return json.loads(entity_json)
+
+      def _serialize_json(obj) -> str:
+          return json.dumps(obj, sort_keys=True, indent=2)
+
+      # Parse arguments
+      _parser = argparse.ArgumentParser(prog='new_entity_1', description='Creates a Feast Entity JSON file.')
+      _parser.add_argument("--entity_name", required=True)
+      _parser.add_argument("--value_type", required=True, choices=["INT64", "FLOAT", "STRING", "BOOL", "BYTES"])
+      _parser.add_argument("--description", required=False, default="")
+      _parser.add_argument("--usecase", required=True)
+      _parser.add_argument("--schemaId", required=True)
+      _parser.add_argument("--domain", required=True)
+      _parser.add_argument("--token", required=True)
+      _parser.add_argument("--output-paths", dest="_output_paths", type=str, nargs=1)
+
+      args = _parser.parse_args()
+
+      #Only pass valid params to entity creation
+      entity_json = create_feast_entity(args.entity_name, args.value_type, args.description)
+
+      # Save to output file
+      if args._output_paths:
+          output_path = args._output_paths[0]
+          os.makedirs(os.path.dirname(output_path), exist_ok=True)
+          with open(output_path, 'w') as f:
+              f.write(_serialize_json(entity_json))
+
+      # Send to API
+      url = f"https://igs.gov-cloud.ai/pi-entity-instances-service/v2.0/schemas/{args.schemaId}/instances"
+      payload = {
+          "data": [
+              {
+                  "usecase": args.usecase,
+                  "type": "entity",
+                  "name": args.entity_name,
+                  "payload": entity_json
+              }
+          ]
+      }
+
+      headers = {
+          "Authorization": f"Bearer {args.token}",
+          "Content-Type": "application/json"
+      }
+
+      try:
+          response = requests.post(url, headers=headers, json=payload)
+          print("Status Code:", response.status_code)
+          print("Response:", response.text)
+      except Exception as e:
+          print("Error during API call:", str(e))
+
+    args:
+    - --entity_name
+    - {inputValue: entity_name}
+    - --value_type
+    - {inputValue: value_type}
+    - if:
+        cond: {isPresent: description}
+        then:
+        - --description
+        - {inputValue: description}
+    - --usecase
+    - {inputValue: usecase}
+    - --schemaId
+    - {inputValue: schemaId}
+    - --domain
+    - {inputValue: domain}
+    - --token
+    - {inputValue: token}
+    - --output-paths
+    - {outputPath: output}
