@@ -1,0 +1,39 @@
+name: Feast_Schema
+description: Converts schema string into JSON object for Feast FeatureViews.
+
+inputs:
+  - {name: schema_str, type: String}
+
+outputs:
+  - {name: schema_json, type: JsonObject}
+
+implementation:
+  container:
+    image: python:3.10
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, json, os
+
+        def _make_parent_dirs_and_return_path(file_path: str):
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            return file_path
+
+        def convert_schema(schema_str, output_path):
+            schema = json.loads(schema_str)
+            with open(output_path, "w") as f:
+                json.dump(schema, f, indent=2)
+
+        parser = argparse.ArgumentParser(description="Schema converter")
+        parser.add_argument("--schema_str", type=str, required=True)
+        parser.add_argument("--output", dest="output_path", type=_make_parent_dirs_and_return_path, required=True)
+        args = parser.parse_args()
+
+        convert_schema(args.schema_str, args.output_path)
+    args:
+      - --schema_str
+      - {inputValue: schema_str}
+      - --output
+      - {outputPath: schema_json}
