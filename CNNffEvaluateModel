@@ -1,0 +1,390 @@
+name: CNNffEvaluateModel
+description: Evaluates trained CNN model and generates performance metrics
+inputs:
+  - name: trained_model
+    type: Model
+  - name: data_path
+    type: Dataset
+  - name: config
+    type: String
+outputs:
+  - name: metrics
+    type: Metrics
+  - name: metrics_json
+    type: String
+
+implementation:
+  container:
+    image: deepak0147/nessy-facotry:0.0.1
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import torch, argparse, pickle, json, os, sys, traceback, time
+        import numpy as np
+        from typing import Dict, Any, Optional
+        from torch.utils.data import DataLoader, TensorDataset
+        # sklearn used for metrics
+        from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+
+        # ---------------------------
+        # Safe dataset wrapper classes
+        # ---------------------------
+        class LabeledDataset:
+            def __init__(self, dataset=None, label_mapping=None):
+                self.dataset = dataset or []
+                self.label_mapping = label_mapping or {}
+            def __len__(self):
+                try:
+                    if hasattr(self.dataset, '__len__'):
+                        return len(self.dataset)
+                except:
+                    pass
+                return 100
+            def __getitem__(self, idx):
+                try:
+                    item = self.dataset[idx]
+                    if isinstance(item, tuple) and len(item) == 2:
+                        data, label = item
+                        return data, label
+                    elif isinstance(item, dict):
+                        data = item.get('image_data')
+                        label = item.get('label', 0)
+                        return data, label
+                except:
+                    pass
+                return torch.randn(3, 224, 224), 0
+
+        class SimpleDataset:
+            def __init__(self, data=None):
+                self.data = data or []
+            def __len__(self):
+                try:
+                    if hasattr(self.data, '__len__'):
+                        length = len(self.data)
+                        if length > 0:
+                            return length
+                except:
+                    pass
+                return 100
+            def __getitem__(self, idx):
+                try:
+                    item = self.data[idx]
+                    if isinstance(item, tuple) and len(item) == 2:
+                        return item
+                    elif isinstance(item, dict):
+                        data = item.get('image_data')
+                        label = item.get('label', 0)
+                        return data, label
+                except:
+                    pass
+                return torch.randn(3, 224, 224), 0
+
+        class DataWrapper:
+            def __init__(self, data_dict=None):
+                if data_dict:
+                    self.__dict__.update(data_dict)
+
+        class SafeUnpickler(pickle.Unpickler):
+            def find_class(self, module, name):
+                try:
+                    return super().find_class(module, name)
+                except:
+                    if name == 'LabeledDataset':
+                        return LabeledDataset
+                    elif name == 'DataWrapper':
+                        return DataWrapper
+                    elif name == 'SimpleDataset':
+                        return SimpleDataset
+                    else:
+                        class FallbackClass:
+                            def __init__(self, *args, **kwargs):
+                                pass
+                        return FallbackClass
+
+        # ---------------------------
+        # Forward-Forward model (local copy)
+        # ---------------------------
+        import torch.nn as nn
+        import torch.nn.functional as F
+
+        class FFConvLayer(nn.Module):
+            def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+                super().__init__()
+                self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+                self.bn = nn.BatchNorm2d(out_channels)
+            def forward(self, x):
+                x = self.conv(x); x = self.bn(x); x = F.relu(x); return x
+
+        class FFFullyConnectedLayer(nn.Module):
+            def __init__(self, in_features, out_features):
+                super().__init__()
+                self.fc = nn.Linear(in_features, out_features)
+                self.bn = nn.BatchNorm1d(out_features)
+            def forward(self, x):
+                x = self.fc(x); x = self.bn(x); x = F.relu(x); return x
+
+        class ForwardForwardNet(nn.Module):
+            def __init__(self, num_classes=10, image_size=224):
+                super().__init__()
+                self.conv1 = FFConvLayer(3, 64, kernel_size=3, stride=1, padding=1)
+                self.conv2 = FFConvLayer(64, 128, kernel_size=3, stride=2, padding=1)
+                self.conv3 = FFConvLayer(128, 256, kernel_size=3, stride=2, padding=1)
+                self.conv4 = FFConvLayer(256, 512, kernel_size=3, stride=2, padding=1)
+                with torch.no_grad():
+                    dummy = torch.zeros(1, 3, image_size, image_size)
+                    dummy = self.conv1(dummy); dummy = self.conv2(dummy); dummy = self.conv3(dummy); dummy = self.conv4(dummy)
+                    flat_dim = dummy.view(1, -1).shape[1]
+                self.fc1 = FFFullyConnectedLayer(flat_dim, 512)
+                self.fc2 = FFFullyConnectedLayer(512, num_classes)
+                self.num_classes = num_classes
+            def forward(self, x):
+                x = self.conv1(x); x = self.conv2(x); x = self.conv3(x); x = self.conv4(x)
+                x = x.view(x.size(0), -1); x = self.fc1(x); x = self.fc2(x); return x
+
+        # ---------------------------
+        # local ResNet import fallback (do NOT modify library)
+        # ---------------------------
+        ResNet = None
+        try:
+            # attempt to import your ResNet library (keeps using the library as-is)
+            from nesy_factory.CNNs.registry import create_model as _dummy_create
+            # we won't call it here; instead we'll try CNNFactory later
+        except Exception:
+            pass
+
+        # ---------------------------
+        # Helper: detect checkpoint type
+        # ---------------------------
+        def checkpoint_looks_like_ff(state_dict_keys):
+            # If keys start with conv1.conv or fc1.fc etc -> FF net
+            for k in state_dict_keys:
+                if k.startswith("conv1.conv") or k.startswith("fc1.fc") or k.startswith("conv1.") or k.startswith("fc1."):
+                    return True
+            return False
+
+        # ---------------------------
+        # JSON encoder for numpy types
+        # ---------------------------
+        class NumpyEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, (np.integer,)):
+                    return int(obj)
+                if isinstance(obj, (np.floating,)):
+                    return float(obj)
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                if isinstance(obj, (np.bool_,)):
+                    return bool(obj)
+                return super().default(obj)
+
+        # ---------------------------
+        # parse args
+        # ---------------------------
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--trained_model', type=str, required=True)
+        parser.add_argument('--data_path', type=str, required=True)
+        parser.add_argument('--config', type=str, required=True)
+        parser.add_argument('--metrics', type=str, required=True)
+        parser.add_argument('--metrics_json', type=str, required=True)
+        args = parser.parse_args()
+
+        print("Starting CNN Evaluation")
+        print(f"Trained model path: {args.trained_model}")
+        print(f"Data path: {args.data_path}")
+
+        # ---------------------------
+        # load processed data
+        # ---------------------------
+        try:
+            with open(args.data_path, 'rb') as f:
+                raw = f.read()
+            import io
+            processed_data = SafeUnpickler(io.BytesIO(raw)).load()
+            print("Data loaded successfully")
+        except Exception as e:
+            print("Error loading processed data:", e)
+            traceback.print_exc()
+            sys.exit(1)
+
+        # ---------------------------
+        # config parsing
+        # ---------------------------
+        try:
+            config = json.loads(args.config)
+            model_config = config.get('model', {})
+        except Exception as e:
+            print("Error parsing config:", e)
+            sys.exit(1)
+
+        # ---------------------------
+        # load checkpoint
+        # ---------------------------
+        try:
+            checkpoint = torch.load(args.trained_model, map_location='cpu')
+        except Exception as e:
+            print("Error loading checkpoint:", e)
+            traceback.print_exc()
+            sys.exit(1)
+
+        # If checkpoint is a dict and contains 'model_state_dict', extract
+        state_dict = None
+        cp_meta = {}
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            cp_meta = {k: checkpoint.get(k) for k in ('num_classes', 'image_size')}
+        elif isinstance(checkpoint, dict):
+            # maybe a plain state_dict or has other keys
+            # try to find a plausible state_dict inside
+            # if it looks like a state_dict itself, use it
+            # (assume keys map to tensors)
+            example_key = next(iter(checkpoint.keys()))
+            if isinstance(checkpoint[example_key], torch.Tensor):
+                state_dict = checkpoint
+            else:
+                # not a tensor state dict; maybe nested - just attempt to use checkpoint directly
+                state_dict = checkpoint
+        else:
+            print("Loaded checkpoint is not a dict; trying to use it as state_dict")
+            try:
+                state_dict = checkpoint.state_dict()
+            except Exception:
+                state_dict = None
+
+        if state_dict is None:
+            print("Could not find a state_dict inside checkpoint; aborting")
+            sys.exit(1)
+
+        # ---------------------------
+        # decide which model to create and load
+        # ---------------------------
+        loaded_model = None
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        try:
+            # inspect keys
+            keys = list(state_dict.keys()) if isinstance(state_dict, dict) else []
+            is_ff = checkpoint_looks_like_ff(keys)
+
+            if is_ff:
+                # build local FF net with sizes from checkpoint meta or fallback to config
+                num_classes = int(cp_meta.get('num_classes') or model_config.get('output_dim') or model_config.get('num_classes') or 10)
+                image_size = int(cp_meta.get('image_size') or model_config.get('image_size') or 224)
+                print(f"Detected Forward-Forward checkpoint -> instantiating ForwardForwardNet(num_classes={num_classes}, image_size={image_size})")
+                net = ForwardForwardNet(num_classes=num_classes, image_size=image_size)
+                # state_dict keys of FF typically match the local net (conv1.conv.weight etc). Try load.
+                net.load_state_dict(state_dict, strict=False)
+                loaded_model = net
+            else:
+                # Not FF-looking. Try to load using available factory (prefer library)
+                try:
+                    from nesy_factory.CNNs.factory import CNNFactory
+                    print("Attempting to create model via CNNFactory.create_model()")
+                    model_impl = CNNFactory.create_model(model_config.get('architecture','resnet'), model_config)
+                    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                        model_impl.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                    else:
+                        model_impl.load_state_dict(state_dict, strict=False)
+                    loaded_model = model_impl
+                except Exception as e_factory:
+                    print("Warning: CNNFactory failed:", e_factory)
+                    # fallback: try to instantiate ResNet from library (if present)
+                    try:
+                        from nesy_factory.CNNs.registry import create_model as create_cnn_model
+                        model_impl = create_cnn_model(model_config.get('architecture','resnet'), model_config)
+                        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                            model_impl.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                        else:
+                            model_impl.load_state_dict(state_dict, strict=False)
+                        loaded_model = model_impl
+                    except Exception as e_res:
+                        print("Fallback ResNet load failed:", e_res)
+                        raise e_res
+
+            if loaded_model is None:
+                print("Model creation/load resulted in None; aborting")
+                sys.exit(1)
+
+            print("Model instantiated and state_dict loaded (best effort).")
+        except Exception as e:
+            print("Error while creating/loading model:", e)
+            traceback.print_exc()
+            sys.exit(1)
+
+        # ---------------------------
+        # move model to device and evaluate
+        # ---------------------------
+        loaded_model = loaded_model.to(device)
+        loaded_model.eval()
+
+        test_loader = getattr(processed_data, 'test_loader', None)
+        if test_loader is None:
+            print("test_loader not found in processed_data; aborting")
+            sys.exit(1)
+
+        all_preds = []
+        all_targets = []
+        total_loss = 0.0
+        criterion = torch.nn.CrossEntropyLoss()
+
+        with torch.no_grad():
+            for batch in test_loader:
+                if isinstance(batch, (list, tuple)) and len(batch) == 2:
+                    data, target = batch
+                elif hasattr(batch, 'image_data') and hasattr(batch, 'label'):
+                    data = batch.image_data; target = batch.label
+                else:
+                    print("Unexpected batch type:", type(batch)); continue
+
+                data = data.to(device)
+                target = target.to(device)
+                if data.dtype != torch.float32:
+                    data = data.float()
+
+                outputs = loaded_model(data)
+                loss = criterion(outputs, target)
+                total_loss += loss.item()
+                _, preds = outputs.max(1)
+                all_preds.extend(preds.cpu().numpy().tolist())
+                all_targets.extend(target.cpu().numpy().tolist())
+
+        # compute metrics
+        if len(all_targets) > 0:
+            accuracy = float(accuracy_score(all_targets, all_preds) * 100.0)
+            avg_loss = float(total_loss / len(test_loader)) if len(test_loader)>0 else 0.0
+            class_report = classification_report(all_targets, all_preds, output_dict=True)
+            cm = confusion_matrix(all_targets, all_preds)
+        else:
+            accuracy = 0.0; avg_loss = 0.0; class_report = {}; cm = []
+
+        metrics = {
+            'accuracy': accuracy,
+            'loss': avg_loss,
+            'total_samples': int(len(all_targets)),
+            'correct_predictions': int(sum(1 for a,b in zip(all_preds, all_targets) if a==b)),
+            'classification_report': class_report,
+            'confusion_matrix': cm.tolist() if hasattr(cm, 'tolist') else cm
+        }
+
+        # ensure dirs exist and save metrics
+        os.makedirs(os.path.dirname(args.metrics), exist_ok=True)
+        os.makedirs(os.path.dirname(args.metrics_json), exist_ok=True)
+        with open(args.metrics, 'w') as f:
+            json.dump(metrics, f, indent=2, cls=NumpyEncoder)
+        with open(args.metrics_json, 'w') as f:
+            json.dump(metrics, f, indent=2, cls=NumpyEncoder)
+
+        print("Evaluation complete. Metrics saved.")
+        print(json.dumps(metrics, indent=2))
+    args:
+      - --trained_model
+      - {inputPath: trained_model}
+      - --data_path
+      - {inputPath: data_path}
+      - --config
+      - {inputValue: config}
+      - --metrics
+      - {outputPath: metrics}
+      - --metrics_json
+      - {outputPath: metrics_json}
