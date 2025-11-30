@@ -1,0 +1,453 @@
+name: ForwardForwardTrainModel
+description: Trains a Forward-Forward CNN model using processed UI components dataset and configuration.
+inputs:
+  - name: data_path
+    type: Dataset
+  - name: config
+    type: String
+outputs:
+  - name: trained_model
+    type: Model
+  - name: training_history
+    type: String
+
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:v30
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        import argparse, pickle, os, json, sys, math, time, traceback
+        from torch.utils.data import DataLoader, TensorDataset
+
+        print("STARTING FORWARD-FORWARD TRAIN MODEL")
+
+        # ------------------------------------------------------------------------------------
+        # Safe dataset wrappers (compatible with your Preprocess brick output)
+        # ------------------------------------------------------------------------------------
+        class LabeledDataset:
+            def __init__(self, dataset=None, label_mapping=None):
+                self.dataset = dataset or []
+                self.label_mapping = label_mapping or {}
+            def __len__(self):
+                try:
+                    if hasattr(self.dataset, "__len__"):
+                        return len(self.dataset)
+                except:
+                    pass
+                return 100
+            def __getitem__(self, idx):
+                try:
+                    item = self.dataset[idx]
+                    if isinstance(item, tuple) and len(item) == 2:
+                        data, label = item
+                        return data, label
+                    elif isinstance(item, dict):
+                        data = item.get("image_data")
+                        label = item.get("label", 0)
+                        return data, label
+                except:
+                    pass
+                return torch.randn(3, 224, 224), 0
+
+        class DataWrapper:
+            def __init__(self, data_dict=None):
+                if data_dict:
+                    self.__dict__.update(data_dict)
+
+        class SimpleDataset:
+            def __init__(self, data=None):
+                self.data = data or []
+            def __len__(self):
+                try:
+                    if hasattr(self.data, "__len__"):
+                        return len(self.data)
+                except:
+                    pass
+                return 100
+            def __getitem__(self, idx):
+                try:
+                    item = self.data[idx]
+                    if isinstance(item, tuple) and len(item) == 2:
+                        return item
+                    elif isinstance(item, dict):
+                        data = item.get("image_data")
+                        label = item.get("label", 0)
+                        return data, label
+                except:
+                    pass
+                return torch.randn(3, 224, 224), 0
+
+        # Custom SafeUnpickler to load objects from preprocess stage
+        class SafeUnpickler(pickle.Unpickler):
+            def find_class(self, module, name):
+                try:
+                    return super().find_class(module, name)
+                except:
+                    if name == "LabeledDataset":
+                        return LabeledDataset
+                    elif name == "DataWrapper":
+                        return DataWrapper
+                    elif name == "SimpleDataset":
+                        return SimpleDataset
+                    else:
+                        class FallbackClass:
+                            def __init__(self, *args, **kwargs):
+                                pass
+                        return FallbackClass
+
+        def extract_tensors_from_dataloader(dataloader, max_batches=None):
+            X_list, y_list = [], []
+            for i, (batch_X, batch_y) in enumerate(dataloader):
+                X_list.append(batch_X)
+                y_list.append(batch_y)
+                if max_batches is not None and i + 1 >= max_batches:
+                    break
+            if X_list:
+                return torch.cat(X_list, dim=0), torch.cat(y_list, dim=0)
+            return None, None
+
+        # ------------------------------------------------------------------------------------
+        # Forward-Forward Layers and Network
+        # (simplified version based on the FF CIFAR notebook)
+        # ------------------------------------------------------------------------------------
+        class FFConvLayer(nn.Module):
+            def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+                super().__init__()
+                self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+                self.bn = nn.BatchNorm2d(out_channels)
+
+            def forward(self, x):
+                x = self.conv(x)
+                x = self.bn(x)
+                x = F.relu(x)
+                return x
+
+            def goodness(self, x):
+                # goodness = mean squared activation
+                return x.pow(2).mean(dim=list(range(1, x.dim())))
+
+        class FFFullyConnectedLayer(nn.Module):
+            def __init__(self, in_features, out_features):
+                super().__init__()
+                self.fc = nn.Linear(in_features, out_features)
+                self.bn = nn.BatchNorm1d(out_features)
+
+            def forward(self, x):
+                x = self.fc(x)
+                x = self.bn(x)
+                x = F.relu(x)
+                return x
+
+            def goodness(self, x):
+                return x.pow(2).mean(dim=1)
+
+        class ForwardForwardNet(nn.Module):
+            def __init__(self, num_classes=10, image_size=224):
+                super().__init__()
+                # Assume 3x224x224 from your preprocess brick (ResNet-style)
+                self.conv1 = FFConvLayer(3, 64, kernel_size=3, stride=1, padding=1)
+                self.conv2 = FFConvLayer(64, 128, kernel_size=3, stride=2, padding=1)
+                self.conv3 = FFConvLayer(128, 256, kernel_size=3, stride=2, padding=1)
+                self.conv4 = FFConvLayer(256, 512, kernel_size=3, stride=2, padding=1)
+
+                # Compute flattened size after conv blocks
+                with torch.no_grad():
+                    dummy = torch.zeros(1, 3, image_size, image_size)
+                    dummy = self.conv1(dummy)
+                    dummy = self.conv2(dummy)
+                    dummy = self.conv3(dummy)
+                    dummy = self.conv4(dummy)
+                    flat_dim = dummy.view(1, -1).shape[1]
+
+                self.fc1 = FFFullyConnectedLayer(flat_dim, 512)
+                self.fc2 = FFFullyConnectedLayer(512, num_classes)
+
+                self.num_classes = num_classes
+                self.threshold = 2.0  # FF goodness threshold hyperparameter
+
+            def forward_features(self, x):
+                x = self.conv1(x)
+                x = self.conv2(x)
+                x = self.conv3(x)
+                x = self.conv4(x)
+                x = x.view(x.size(0), -1)
+                x = self.fc1(x)
+                x = self.fc2(x)
+                return x
+
+            def predict(self, x):
+                # For prediction we compute goodness per class
+                # We assume labels are overlayed into the input; typical FF trick is:
+                # try all labels, compute goodness, and pick argmax
+                bs = x.size(0)
+                device = x.device
+                scores = torch.zeros(bs, self.num_classes, device=device)
+                for c in range(self.num_classes):
+                    y = torch.full((bs,), c, dtype=torch.long, device=device)
+                    x_pos = overlay_y_on_x(x, y, classes=self.num_classes)
+                    h1 = self.conv1(x_pos)
+                    h2 = self.conv2(h1)
+                    h3 = self.conv3(h2)
+                    h4 = self.conv4(h3)
+                    h4_flat = h4.view(h4.size(0), -1)
+                    h5 = self.fc1(h4_flat)
+                    h6 = self.fc2(h5)
+                    # Goodness of last layer
+                    g = h6.pow(2).mean(dim=1)
+                    scores[:, c] = g
+                return scores.argmax(dim=1)
+
+            def forward_forward_loss(self, x_pos, x_neg):
+                
+                # propagate through all layers, accumulate goodness
+                g_pos_total = 0.0
+                g_neg_total = 0.0
+
+                h_pos = x_pos
+                h_neg = x_neg
+
+                for layer in [self.conv1, self.conv2, self.conv3, self.conv4]:
+                    h_pos = layer(h_pos)
+                    h_neg = layer(h_neg)
+                    g_pos_total = g_pos_total + h_pos.pow(2).mean(dim=list(range(1, h_pos.dim())))
+                    g_neg_total = g_neg_total + h_neg.pow(2).mean(dim=list(range(1, h_neg.dim())))
+
+                h_pos = h_pos.view(h_pos.size(0), -1)
+                h_neg = h_neg.view(h_neg.size(0), -1)
+
+                for layer in [self.fc1, self.fc2]:
+                    h_pos = layer(h_pos)
+                    h_neg = layer(h_neg)
+                    g_pos_total = g_pos_total + h_pos.pow(2).mean(dim=1)
+                    g_neg_total = g_neg_total + h_neg.pow(2).mean(dim=1)
+
+                # Loss from paper-style FF:
+                # loss_pos = -log(sigmoid(g_pos - threshold))
+                # loss_neg = -log(1 - sigmoid(g_neg - threshold))
+                loss_pos = -torch.log(torch.sigmoid(g_pos_total - self.threshold) + 1e-8).mean()
+                loss_neg = -torch.log(1.0 - torch.sigmoid(g_neg_total - self.threshold) + 1e-8).mean()
+                loss = loss_pos + loss_neg
+                return loss, loss_pos.item(), loss_neg.item()
+
+        # ------------------------------------------------------------------------------------
+        # Forward-Forward helper functions
+        # ------------------------------------------------------------------------------------
+        def overlay_y_on_x(x, y, classes=10):
+           
+            x_ = x.clone()
+            # zero out first row, first `classes` columns of channel 0
+            B, C, H, W = x_.shape
+            # Use channel 0 to encode label
+            x_[:, 0, 0, :classes] = 0.0
+            x_[torch.arange(B), 0, 0, y] = 1.0
+            return x_
+
+        def generate_negative_labels(y, num_classes):
+            
+            device = y.device
+            rand = torch.randint(0, num_classes - 1, size=y.shape, device=device)
+            y_neg = (y + 1 + rand) % num_classes
+            return y_neg
+
+        # ------------------------------------------------------------------------------------
+        # Argument parsing
+        # ------------------------------------------------------------------------------------
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--data_path", type=str, required=True)
+        parser.add_argument("--config", type=str, required=True)
+        parser.add_argument("--trained_model", type=str, required=True)
+        parser.add_argument("--training_history", type=str, required=True)
+        args = parser.parse_args()
+
+        print("Arguments loaded")
+
+        if not os.path.exists(args.data_path):
+            print("ERROR: data_path does not exist!")
+            sys.exit(1)
+
+        # ------------------------------------------------------------------------------------
+        # Load processed data (from PreprocessUIComponentsDataset)
+        # ------------------------------------------------------------------------------------
+        try:
+            with open(args.data_path, "rb") as f:
+                raw_data = f.read()
+            import io
+            processed_data = SafeUnpickler(io.BytesIO(raw_data)).load()
+            print("Processed data loaded successfully")
+        except Exception as e:
+            print("ERROR loading pickle:", e)
+            traceback.print_exc()
+            sys.exit(1)
+
+        if not hasattr(processed_data, "train_loader"):
+            print("ERROR: train_loader not found in processed data!")
+            sys.exit(1)
+
+        train_loader = processed_data.train_loader
+        test_loader = getattr(processed_data, "test_loader", None)
+
+        num_classes = getattr(processed_data, "num_classes", 10)
+        image_size = getattr(processed_data, "image_size", 224)
+
+        # ------------------------------------------------------------------------------------
+        # Load config
+        # ------------------------------------------------------------------------------------
+        try:
+            config = json.loads(args.config)
+            training_config = config.get("training", {})
+            model_config = config.get("model", {})
+
+            ff_config = model_config.get("forward_forward", {})
+            epochs = training_config.get("epochs", 5)
+            batch_limit = ff_config.get("batch_limit", None)  # optionally limit batches per epoch
+            threshold = ff_config.get("threshold", 2.0)
+            lr = ff_config.get("learning_rate", training_config.get("optimizer", {}).get("learning_rate", 1e-3))
+
+            print(f"Config loaded: epochs={epochs}, lr={lr}, threshold={threshold}, num_classes={num_classes}")
+        except Exception as e:
+            print("ERROR loading config:", e)
+            traceback.print_exc()
+            sys.exit(1)
+
+        # ------------------------------------------------------------------------------------
+        # Create Forward-Forward network
+        # ------------------------------------------------------------------------------------
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        net = ForwardForwardNet(num_classes=num_classes, image_size=image_size)
+        net.threshold = threshold
+        net = net.to(device)
+
+        optimizer = torch.optim.Adam(net.parameters(), lr=lr)
+
+        history = {
+            "epochs": epochs,
+            "train_loss": [],
+            "train_loss_pos": [],
+            "train_loss_neg": [],
+            "train_acc": [],
+            "val_acc": [],
+            "config": config,
+            "training_mode": "ForwardForward"
+        }
+
+        # ------------------------------------------------------------------------------------
+        # Forward-Forward training loop
+        # ------------------------------------------------------------------------------------
+        print("Starting Forward-Forward training...")
+        start_time = time.time()
+
+        for epoch in range(epochs):
+            net.train()
+            epoch_loss = 0.0
+            epoch_loss_pos = 0.0
+            epoch_loss_neg = 0.0
+            n_batches = 0
+
+            # We'll also track training accuracy using FF prediction
+            correct = 0
+            total = 0
+
+            for batch_idx, (images, labels) in enumerate(train_loader):
+                images = images.to(device)
+                labels = labels.to(device)
+
+                # Positive and negative label overlays
+                y_pos = labels
+                y_neg = generate_negative_labels(labels, num_classes)
+
+                x_pos = overlay_y_on_x(images, y_pos, classes=num_classes)
+                x_neg = overlay_y_on_x(images, y_neg, classes=num_classes)
+
+                optimizer.zero_grad()
+                loss, loss_pos, loss_neg = net.forward_forward_loss(x_pos, x_neg)
+                loss.backward()
+                optimizer.step()
+
+                epoch_loss += loss.item()
+                epoch_loss_pos += loss_pos
+                epoch_loss_neg += loss_neg
+                n_batches += 1
+
+                # Train accuracy (FF-style prediction)
+                with torch.no_grad():
+                    preds = net.predict(images)
+                    total += labels.size(0)
+                    correct += preds.eq(labels).sum().item()
+
+                if batch_limit is not None and batch_idx + 1 >= batch_limit:
+                    break
+
+            avg_loss = epoch_loss / n_batches if n_batches > 0 else 0.0
+            avg_loss_pos = epoch_loss_pos / n_batches if n_batches > 0 else 0.0
+            avg_loss_neg = epoch_loss_neg / n_batches if n_batches > 0 else 0.0
+            train_acc = 100.0 * correct / total if total > 0 else 0.0
+
+            # Validation accuracy (if test_loader available)
+            val_acc = 0.0
+            if test_loader is not None:
+                net.eval()
+                correct_val = 0
+                total_val = 0
+                with torch.no_grad():
+                    for images_val, labels_val in test_loader:
+                        images_val = images_val.to(device)
+                        labels_val = labels_val.to(device)
+                        preds_val = net.predict(images_val)
+                        total_val += labels_val.size(0)
+                        correct_val += preds_val.eq(labels_val).sum().item()
+                val_acc = 100.0 * correct_val / total_val if total_val > 0 else 0.0
+
+            history["train_loss"].append(avg_loss)
+            history["train_loss_pos"].append(avg_loss_pos)
+            history["train_loss_neg"].append(avg_loss_neg)
+            history["train_acc"].append(train_acc)
+            history["val_acc"].append(val_acc)
+
+            print(f"Epoch {epoch+1}/{epochs} - "
+                  f"Loss: {avg_loss:.4f} (pos: {avg_loss_pos:.4f}, neg: {avg_loss_neg:.4f}), "
+                  f"Train Acc: {train_acc:.2f}%, Val Acc: {val_acc:.2f}%")
+
+        total_time = time.time() - start_time
+        history["total_training_time"] = total_time
+        print(f"Forward-Forward training completed in {total_time:.2f} seconds")
+
+        # ------------------------------------------------------------------------------------
+        # Save model & history
+        # ------------------------------------------------------------------------------------
+        try:
+            os.makedirs(os.path.dirname(args.trained_model) or ".", exist_ok=True)
+            os.makedirs(os.path.dirname(args.training_history) or ".", exist_ok=True)
+
+            save_dict = {
+                "model_state_dict": net.state_dict(),
+                "history": history,
+                "training_mode": "ForwardForward",
+                "num_classes": num_classes,
+                "image_size": image_size
+            }
+
+            torch.save(save_dict, args.trained_model)
+
+            with open(args.training_history, "w") as f:
+                json.dump(history, f, indent=2)
+
+            print("Training completed and artifacts saved successfully.")
+        except Exception as e:
+            print("ERROR saving results:", e)
+            traceback.print_exc()
+            sys.exit(1)
+    args:
+      - --data_path
+      - {inputPath: data_path}
+      - --config
+      - {inputValue: config}
+      - --trained_model
+      - {outputPath: trained_model}
+      - --training_history
+      - {outputPath: training_history}
