@@ -1,4 +1,4 @@
-name: ForwardForwardTrainModel
+name: FFTrainModel
 description: Trains a Forward-Forward CNN model using processed UI components dataset and configuration.
 inputs:
   - name: data_path
