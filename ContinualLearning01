@@ -16,6 +16,7 @@ inputs:
 
   - name: previous_replay_buffer
     type: Dataset
+    optional: true
 
   - name: config
     type: String
