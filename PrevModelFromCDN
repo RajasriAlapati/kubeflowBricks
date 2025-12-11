@@ -1,0 +1,84 @@
+name: PrevModelFromCDN
+description: >
+  Downloads a previous model checkpoint from a CDN URL and writes it to a local file
+  so it can be passed as prev_model into ContinualTrainCNNModell.
+
+inputs:
+  - name: cdn_url
+    type: String
+    description: "CDN URL pointing to the previous model checkpoint (binary file)."
+
+outputs:
+  - name: prev_model
+    type: String
+    description: "Local file path of the downloaded checkpoint, to be used as prev_model."
+
+implementation:
+  container:
+    image: python:3.9-slim
+    command:
+      - sh
+      - -c
+      - |
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import os
+        import sys
+        import traceback
+
+        # We use requests to download the file
+        try:
+            import requests
+        except ImportError:
+            import subprocess
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
+            import requests
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--cdn_url", type=str, required=True)
+        parser.add_argument("--prev_model", type=str, required=True)
+        args = parser.parse_args()
+
+        print(f"CDN URL: {args.cdn_url}")
+        print(f"Target checkpoint path: {args.prev_model}")
+
+        try:
+            # Ensure parent directory exists
+            out_dir = os.path.dirname(args.prev_model)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+
+            # Download the file from CDN
+            print("Downloading checkpoint from CDN...")
+            resp = requests.get(args.cdn_url, stream=True)
+            resp.raise_for_status()
+
+            # Write binary content directly to the prev_model path
+            with open(args.prev_model, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+
+            print(f"Checkpoint downloaded and saved to {args.prev_model}")
+
+            # Note:
+            # For KFP String output with {outputPath: prev_model},
+            # the path of this file (args.prev_model) will be passed as
+            # the argument value to the next brick via {inputPath: prev_model}.
+            # ContinualTrainCNNModell then does:
+            #   torch.load(args.prev_model)
+            # which will load this file as the checkpoint.
+        except Exception as e:
+            print("ERROR downloading or saving checkpoint:", e)
+            traceback.print_exc()
+            sys.exit(1)
+
+    args:
+      - --cdn_url
+      - {inputValue: cdn_url}
+      - --prev_model
+      - {outputPath: prev_model}
