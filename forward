@@ -26,6 +26,12 @@ implementation:
         from torch.utils.data import TensorDataset, DataLoader
         import nesy_factory.CNNs.ffresnet as ffresnet
 
+        # Define DataWrapper class to handle unpickling issue
+        class DataWrapper:
+            def __init__(self, d=None):
+                if d:
+                    self.__dict__.update(d)
+
         # Safe unpickler to load datasets safely
         class SafeUnpickler(pickle.Unpickler):
             def find_class(self, module, name):
