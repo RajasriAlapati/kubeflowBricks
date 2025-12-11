@@ -342,11 +342,11 @@ implementation:
             print(f"[Epoch {epoch+1}/{num_epochs}] loss={metrics['loss'][-1]:.4f} acc={metrics['accuracy'][-1]:.4f}")
 
         # Save updated model state_dict
-        os.makedirs(os.path.dirname(args.model_path) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
         torch.save(model.state_dict(), args.model_path)
 
         # Save updated replay buffer (buf_x, buf_y)
-        os.makedirs(os.path.dirname(args.replay_out) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(args.replay_out), exist_ok=True)
         with open(args.replay_out, "wb") as f:
             pickle.dump({"x": buf_x, "y": buf_y}, f)
 
