@@ -14,6 +14,9 @@ inputs:
   - name: previous_model
     type: Model
 
+  - name: previous_replay_buffer
+    type: Dataset
+
   - name: config
     type: String
 
@@ -32,7 +35,7 @@ implementation:
       - -c
       - |
         python3 -m pip install --quiet --upgrade pip setuptools wheel
-        python3 -m pip install --quiet "torch==1.13.1+cpu" "torchvision==0.14.1+cpu" -f https://download.pytorch.org/whl/cpu/torch_stable.html
+        python3 -m pip install --quiet "torch==2.2.0" "torchvision==0.17.0" 
         python3 -m pip install --quiet pandas numpy scikit-learn
         exec "$0" "$@"
       - python3
@@ -48,6 +51,7 @@ implementation:
         parser = argparse.ArgumentParser()
         parser.add_argument("--processed_data_pickle", required=True)
         parser.add_argument("--previous_model", required=False)
+        parser.add_argument("--previous_replay_buffer", required=False)
         parser.add_argument("--config", required=True)
         parser.add_argument("--updated_model", required=True)
         parser.add_argument("--updated_replay_buffer", required=True)
@@ -63,8 +67,12 @@ implementation:
 
         # -----------------------------
         # Load replay buffer
-        # ----------------------------
-        replay_buffer = []
+        # -----------------------------
+        if args.previous_replay_buffer and os.path.exists(args.previous_replay_buffer):
+            with open(args.previous_replay_buffer, "rb") as f:
+                replay_buffer = pickle.load(f)
+        else:
+            replay_buffer = []
 
         # -----------------------------
         # Load or create the model
@@ -139,6 +147,9 @@ implementation:
       - --previous_model
       - {inputPath: previous_model}
 
+      - --previous_replay_buffer
+      - {inputPath: previous_replay_buffer}
+
       - --config
       - {inputValue: config}
 
@@ -147,3 +158,4 @@ implementation:
 
       - --updated_replay_buffer
       - {outputPath: updated_replay_buffer}
+
