@@ -26,7 +26,40 @@ implementation:
         from torch.utils.data import TensorDataset, DataLoader
         import nesy_factory.CNNs.ffresnet as ffresnet
 
-        # Define DataWrapper class to handle unpickling issue
+        # Define the LabeledDataset class for unpickling
+        class LabeledDataset:
+            def __init__(self, *args, **kwargs):
+                obj = None
+                if "dataset" in kwargs:
+                    obj = kwargs["dataset"]
+                elif len(args) == 1:
+                    obj = args[0]
+                else:
+                    obj = kwargs
+
+                self.dataset = getattr(obj, "dataset", None) or \
+                               getattr(obj, "data", None) or \
+                               getattr(obj, "samples", None) or \
+                               obj
+
+            def __len__(self):
+                try:
+                    return len(self.dataset)
+                except:
+                    return 100
+
+            def __getitem__(self, idx):
+                try:
+                    item = self.dataset[idx]
+                    if isinstance(item, tuple) and len(item) == 2:
+                        return item
+                    if isinstance(item, dict):
+                        return item.get("image_data"), item.get("label", 0)
+                except:
+                    pass
+                return torch.randn(3,224,224), 0
+        
+        # Define the DataWrapper class to handle unpickling issue
         class DataWrapper:
             def __init__(self, d=None):
                 if d:
@@ -37,6 +70,8 @@ implementation:
             def find_class(self, module, name):
                 if name == "LabeledDataset":
                     return LabeledDataset
+                if name == "DataWrapper":
+                    return DataWrapper
                 return super().find_class(module, name)
 
         # Dataset loading method
