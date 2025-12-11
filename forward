@@ -21,6 +21,16 @@ implementation:
       - -u
       - -c
       - |
+        set -e
+        # Install common ML packages (optional; remove or pin as needed)
+        python3 -m pip install --quiet --upgrade pip setuptools wheel
+        python3 -m pip install --quiet "torch" "pillow" "torchvision"
+        # Hand over control to the next command in the list
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
         import torch
         import argparse, pickle, os, json, sys, time, io, traceback
         from torch.utils.data import TensorDataset, DataLoader
