@@ -14,10 +14,6 @@ inputs:
   - name: previous_model
     type: Model
 
-  - name: previous_replay_buffer
-    type: String
-    optional: true
-
   - name: config
     type: String
 
@@ -52,7 +48,6 @@ implementation:
         parser = argparse.ArgumentParser()
         parser.add_argument("--processed_data_pickle", required=True)
         parser.add_argument("--previous_model", required=False)
-        parser.add_argument("--previous_replay_buffer", required=False)
         parser.add_argument("--config", required=True)
         parser.add_argument("--updated_model", required=True)
         parser.add_argument("--updated_replay_buffer", required=True)
@@ -68,12 +63,8 @@ implementation:
 
         # -----------------------------
         # Load replay buffer
-        # -----------------------------
-        if args.previous_replay_buffer and os.path.exists(args.previous_replay_buffer):
-            with open(args.previous_replay_buffer, "rb") as f:
-                replay_buffer = pickle.load(f)
-        else:
-            replay_buffer = []
+        # ----------------------------
+        replay_buffer = []
 
         # -----------------------------
         # Load or create the model
@@ -147,9 +138,6 @@ implementation:
 
       - --previous_model
       - {inputPath: previous_model}
-
-      - --previous_replay_buffer
-      - {inputPath: previous_replay_buffer}
 
       - --config
       - {inputValue: config}
