@@ -71,6 +71,18 @@ implementation:
         import numpy as np
         from torch.utils.data import DataLoader, TensorDataset
 
+        # ---------- DataWrapper Class ----------
+        class DataWrapper:
+            def __init__(self, data_dict=None):
+                if data_dict:
+                    self.__dict__.update(data_dict)
+
+            def __getattr__(self, name):
+                if name in self.__dict__:
+                    return self.__dict__[name]
+                else:
+                    raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+
         # ---------- Universal loader ----------
         def universal_load_state_dict(prev_path):
             '''
@@ -82,7 +94,7 @@ implementation:
                 return None, "no-path"
             if os.path.isdir(prev_path):
                 # try common filenames
-                candidates = ["model.pt","model.pth","model.ckpt","trained_model.pt","checkpoint.pt","state_dict.pth"]
+                candidates = ["model.pt", "model.pth", "model.ckpt", "trained_model.pt", "checkpoint.pt", "state_dict.pth"]
                 for c in candidates:
                     p = os.path.join(prev_path, c)
                     if os.path.exists(p):
@@ -101,20 +113,20 @@ implementation:
             # If ckpt is dict
             if isinstance(ckpt, dict):
                 # common keys
-                for key in ("model_state_dict","state_dict","model"):
+                for key in ("model_state_dict", "state_dict", "model"):
                     if key in ckpt and isinstance(ckpt[key], dict):
                         return ckpt[key], f"found-key-{key}"
                 # if ckpt itself looks like a state_dict
-                all_tensor_vals = all(hasattr(v,"dtype") or isinstance(v,(torch.Tensor,)) for v in ckpt.values()) if len(ckpt)>0 else False
+                all_tensor_vals = all(hasattr(v, "dtype") or isinstance(v, (torch.Tensor,)) for v in ckpt.values()) if len(ckpt) > 0 else False
                 if all_tensor_vals:
                     return ckpt, "raw-state-dict"
                 # nested: try to find first dict-like value that looks like a state_dict
-                for k,v in ckpt.items():
+                for k, v in ckpt.items():
                     if isinstance(v, dict):
                         # check if values look like tensors or arrays
-                        if len(v)>0:
+                        if len(v) > 0:
                             sample = next(iter(v.values()))
-                            if isinstance(sample, (torch.Tensor, np.ndarray)) or hasattr(sample,'dtype'):
+                            if isinstance(sample, (torch.Tensor, np.ndarray)) or hasattr(sample, 'dtype'):
                                 return v, f"nested-key-{k}"
                 # not found
                 return None, "dict-but-no-state"
@@ -146,6 +158,7 @@ implementation:
                     nn.ReLU(),
                     nn.Linear(128, num_classes)
                 )
+
             def forward(self, x):
                 return self.fc(self.conv(x))
 
@@ -280,8 +293,8 @@ implementation:
             replay_x = np.array([], dtype=new_x.dtype).reshape(0,*new_x.shape[1:])
             replay_y = np.array([], dtype=new_y.dtype)
         # Create combined pool
-        combined_x = np.concatenate([new_x, replay_x], axis=0) if len(replay_x)>0 else new_x
-        combined_y = np.concatenate([new_y, replay_y], axis=0) if len(replay_y)>0 else new_y
+        combined_x = np.concatenate([new_x, replay_x], axis=0) if len(replay_x) > 0 else new_x
+        combined_y = np.concatenate([new_y, replay_y], axis=0) if len(replay_y) > 0 else new_y
 
         # If combined size > replay_buffer_size, keep most recent new_x plus sampled old
         if len(combined_x) > replay_buffer_size:
@@ -310,7 +323,7 @@ implementation:
         # Create DataLoader
         tensor_x = torch.tensor(buf_x, dtype=torch.float32)
         tensor_y = torch.tensor(buf_y, dtype=torch.long)
-        loader = DataLoader(TensorDataset(tensor_x, tensor_y), batch_size=int(cfg.get("batch_size",32)), shuffle=True)
+        loader = DataLoader(TensorDataset(tensor_x, tensor_y), batch_size=int(cfg.get("batch_size", 32)), shuffle=True)
 
         # Training
         device = torch.device("cuda" if torch.cuda.is_available() and cfg.get("use_cuda", False) else "cpu")
@@ -338,10 +351,9 @@ implementation:
                 correct += (preds == yb).sum().item()
                 total += yb.size(0)
             metrics["loss"].append(total_loss / len(loader))
-            metrics["accuracy"].append(correct / total if total>0 else 0.0)
-            print(f"[Epoch {epoch+1}/{num_epochs}] loss={metrics['loss'][-1]:.4f} acc={metrics['accuracy'][-1]:.4f}")
+            metrics["accuracy"].append(correct / total if total > 0 else 0.0)
 
-        # Save updated model state_dict
+        # Save model
         os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
         torch.save(model.state_dict(), args.model_path)
 
