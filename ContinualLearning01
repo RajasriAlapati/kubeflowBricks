@@ -222,6 +222,113 @@ implementation:
             def forward(self, x):
                 return self.fc(self.conv(x))
 
+        # ---------- Enhanced data extraction ----------
+        def extract_data_from_object(data_obj):
+            """
+            Robustly extract (x, y) data from various pickle formats.
+            Returns: (numpy_x, numpy_y) or raises RuntimeError
+            """
+            print(f"Data object type: {type(data_obj)}")
+            
+            # Case 1: Direct dict with 'x' and 'y'
+            if isinstance(data_obj, dict):
+                if "x" in data_obj and "y" in data_obj:
+                    print("Found dict with 'x' and 'y' keys")
+                    return np.array(data_obj["x"]), np.array(data_obj["y"])
+                
+                # Check for common alternative keys
+                for x_key in ["data", "images", "X", "inputs", "features"]:
+                    for y_key in ["labels", "targets", "Y", "outputs", "classes"]:
+                        if x_key in data_obj and y_key in data_obj:
+                            print(f"Found dict with '{x_key}' and '{y_key}' keys")
+                            return np.array(data_obj[x_key]), np.array(data_obj[y_key])
+            
+            # Case 2: TensorDataset
+            if hasattr(data_obj, 'tensors'):
+                print("Found TensorDataset")
+                tensors = data_obj.tensors
+                if len(tensors) >= 2:
+                    return tensors[0].numpy(), tensors[1].numpy()
+            
+            # Case 3: Custom dataset objects with extractable attributes
+            for x_attr in ["dataset", "data", "x", "images", "X"]:
+                for y_attr in ["labels", "targets", "y", "Y"]:
+                    if hasattr(data_obj, x_attr) and hasattr(data_obj, y_attr):
+                        print(f"Found object with '{x_attr}' and '{y_attr}' attributes")
+                        x_data = getattr(data_obj, x_attr)
+                        y_data = getattr(data_obj, y_attr)
+                        return np.array(x_data), np.array(y_data)
+            
+            # Case 4: List/tuple of (x, y) pairs
+            try:
+                # Convert to list if needed
+                if hasattr(data_obj, '__iter__') and not isinstance(data_obj, (str, dict)):
+                    data_list = list(data_obj)
+                    if len(data_list) > 0:
+                        first_item = data_list[0]
+                        if isinstance(first_item, (list, tuple)) and len(first_item) >= 2:
+                            print(f"Found list of {len(data_list)} (x, y) tuples")
+                            xs = [np.array(item[0]) for item in data_list]
+                            ys = [int(item[1]) for item in data_list]
+                            return np.array(xs), np.array(ys)
+            except Exception as e:
+                print(f"Failed to extract as list of tuples: {e}")
+            
+            # Case 5: LabeledDataset or CustomJSONDataset
+            if isinstance(data_obj, (LabeledDataset, CustomJSONDataset)):
+                print(f"Found {type(data_obj).__name__}")
+                try:
+                    # Try to extract all items
+                    dataset_attr = getattr(data_obj, 'dataset', None) or getattr(data_obj, 'data', None)
+                    if dataset_attr is not None:
+                        if isinstance(dataset_attr, list):
+                            xs, ys = [], []
+                            for item in dataset_attr:
+                                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                                    xs.append(np.array(item[0]))
+                                    ys.append(int(item[1]))
+                                elif isinstance(item, dict):
+                                    xs.append(np.array(item.get('image_data', item.get('data', []))))
+                                    ys.append(int(item.get('label', 0)))
+                            if xs:
+                                return np.array(xs), np.array(ys)
+                except Exception as e:
+                    print(f"Failed to extract from custom dataset: {e}")
+            
+            # Case 6: Try using __getitem__ if available
+            if hasattr(data_obj, '__getitem__') and hasattr(data_obj, '__len__'):
+                try:
+                    length = len(data_obj)
+                    print(f"Found indexable object with length {length}")
+                    xs, ys = [], []
+                    for i in range(min(length, 10000)):  # Safety limit
+                        try:
+                            item = data_obj[i]
+                            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                                xs.append(np.array(item[0]))
+                                ys.append(int(item[1]))
+                        except Exception:
+                            break
+                    if xs:
+                        return np.array(xs), np.array(ys)
+                except Exception as e:
+                    print(f"Failed to extract via indexing: {e}")
+            
+            # Case 7: Single numpy array (assume labels are 0)
+            try:
+                arr = np.array(data_obj)
+                if arr.ndim >= 2:
+                    print(f"Converted to numpy array with shape {arr.shape}")
+                    return arr, np.zeros(len(arr), dtype=int)
+            except Exception as e:
+                print(f"Failed to convert to numpy array: {e}")
+            
+            # If all else fails
+            raise RuntimeError(
+                f"Unsupported input dataset format. Type: {type(data_obj)}. "
+                f"Available attributes: {dir(data_obj)[:10]}..."
+            )
+
         # ---------- Replay helper ----------
         def load_replay_buffer(path):
             if path and os.path.exists(path):
@@ -260,52 +367,30 @@ implementation:
         prev_ckpt_path = cfg.get("prev_checkpoint_path", None) or args.prev_model
         replay_sampling = cfg.get("replay_sampling", "random")
 
-        # load new data: accept some common formats:
-        #  - pickled dict with keys 'x','y' where x: numpy array or list of arrays, y: labels
-        #  - pickled TensorDataset or list of tuples
+        # Load new data using robust extraction
+        print(f"Loading data from: {args.data_path}")
         with open(args.data_path, "rb") as f:
             data_obj = pickle.load(f)
 
-        # try to coerce to numpy arrays
-        def to_numpy_list(x):
-            if isinstance(x, np.ndarray):
-                return [x]
-            if isinstance(x, list):
-                return x
-            if hasattr(x, "tolist"):
-                return [np.array(x)]
-            return list(x)
-
-        new_x, new_y = None, None
-        # common patterns
-        if isinstance(data_obj, dict) and "x" in data_obj and "y" in data_obj:
-            new_x = np.array(data_obj["x"])
-            new_y = np.array(data_obj["y"])
-        elif isinstance(data_obj, (list, tuple)):
-            # list of (x,y)
-            xs = []
-            ys = []
-            for item in data_obj:
-                if isinstance(item, (list,tuple)) and len(item) >= 2:
-                    xs.append(np.array(item[0]))
-                    ys.append(int(item[1]))
-            new_x = np.array(xs)
-            new_y = np.array(ys)
-        else:
-            # last resort: try numpy
-            try:
-                arr = np.array(data_obj)
-                new_x = arr
-                new_y = np.zeros(len(arr), dtype=int)
-            except Exception:
-                raise RuntimeError("Unsupported input dataset format")
+        try:
+            new_x, new_y = extract_data_from_object(data_obj)
+            print(f"Successfully extracted data. X shape: {new_x.shape}, Y shape: {new_y.shape}")
+        except Exception as e:
+            print(f"Error extracting data: {e}")
+            raise
 
         # Ensure shapes: new_x shape = (N, C, H, W)
         # If input is (N, H, W, C) convert
         if new_x.ndim == 4 and new_x.shape[-1] in (1,3):
             # NHWC -> NCHW
             if new_x.shape[-1] in (1,3):
+                print(f"Converting from NHWC to NCHW format")
                 new_x = np.transpose(new_x, (0,3,1,2))
+
+        # If 3D, add channel dimension
+        if new_x.ndim == 3:
+            print("Adding channel dimension to 3D data")
+            new_x = np.expand_dims(new_x, axis=1)
 
         # cast to float32
         new_x = new_x.astype(np.float32)
@@ -319,13 +404,16 @@ implementation:
                     rb = pickle.load(f)
                 replay_x = np.array(rb.get("x", []))
                 replay_y = np.array(rb.get("y", []))
-            except Exception:
+                print(f"Loaded replay buffer: {len(replay_x)} samples")
+            except Exception as e:
+                print(f"Failed to load replay buffer: {e}")
                 replay_x, replay_y = None, None
 
         # Create model and try to load previous checkpoint with heuristics
-        num_classes = int(cfg.get("num_classes", 10))
-        input_channels = int(cfg.get("input_channels", 3))
+        num_classes = int(cfg.get("num_classes", max(10, int(new_y.max()) + 1)))
+        input_channels = int(cfg.get("input_channels", new_x.shape[1] if new_x.ndim == 4 else 3))
 
+        print(f"Creating model: {input_channels} channels, {num_classes} classes")
         model = SimpleCNN(input_channels, num_classes)
 
         # Try universal loader: check prev_ckpt_path, then args.prev_model
@@ -349,9 +437,10 @@ implementation:
             print("=> No usable checkpoint/state_dict found or applied. Continuing from init weights.")
 
         # Merge replay: simple concatenation with optional reservoir sampling
-        if replay_x is None:
+        if replay_x is None or len(replay_x) == 0:
             replay_x = np.array([], dtype=new_x.dtype).reshape(0,*new_x.shape[1:])
             replay_y = np.array([], dtype=new_y.dtype)
+        
         # Create combined pool
         combined_x = np.concatenate([new_x, replay_x], axis=0) if len(replay_x)>0 else new_x
         combined_y = np.concatenate([new_y, replay_y], axis=0) if len(replay_y)>0 else new_y
@@ -380,19 +469,23 @@ implementation:
             buf_x = combined_x
             buf_y = combined_y
 
+        print(f"Final training buffer size: {len(buf_x)} samples")
+
         # Create DataLoader
         tensor_x = torch.tensor(buf_x, dtype=torch.float32)
         tensor_y = torch.tensor(buf_y, dtype=torch.long)
-        loader = DataLoader(TensorDataset(tensor_x, tensor_y), batch_size=int(cfg.get("batch_size", 32)), shuffle=True)
+        loader = DataLoader(TensorDataset(tensor_x, tensor_y), batch_size=batch_size, shuffle=True)
 
         # Training
         device = torch.device("cuda" if torch.cuda.is_available() and cfg.get("use_cuda", False) else "cpu")
+        print(f"Using device: {device}")
         model = model.to(device)
         optimizer = optim.Adam(model.parameters(), lr=lr)
         criterion = nn.CrossEntropyLoss()
 
         metrics = {"loss": [], "accuracy": [], "loaded_checkpoint": bool(loaded_any)}
 
+        print(f"Starting training for {num_epochs} epochs...")
         for epoch in range(num_epochs):
             model.train()
             total_loss = 0.0
@@ -410,25 +503,32 @@ implementation:
                 preds = out.argmax(dim=1)
                 correct += (preds == yb).sum().item()
                 total += yb.size(0)
-            metrics["loss"].append(total_loss / len(loader))
-            metrics["accuracy"].append(correct / total if total > 0 else 0.0)
+            
+            epoch_loss = total_loss / len(loader)
+            epoch_acc = correct / total if total > 0 else 0.0
+            metrics["loss"].append(epoch_loss)
+            metrics["accuracy"].append(epoch_acc)
+            print(f"Epoch {epoch+1}/{num_epochs} - Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.4f}")
 
         # Save model
-        os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
+        os.makedirs(os.path.dirname(args.model_path) or ".", exist_ok=True)
         torch.save(model.state_dict(), args.model_path)
 
         # Save updated replay buffer (buf_x, buf_y)
-        os.makedirs(os.path.dirname(args.replay_out), exist_ok=True)
+        os.makedirs(os.path.dirname(args.replay_out) or ".", exist_ok=True)
         with open(args.replay_out, "wb") as f:
             pickle.dump({"x": buf_x, "y": buf_y}, f)
 
         # Save metrics
+        os.makedirs(os.path.dirname(args.metrics_out) or ".", exist_ok=True)
         with open(args.metrics_out, "w") as f:
             json.dump(metrics, f)
 
+        print("="*50)
         print("Saved model:", args.model_path)
         print("Saved replay buffer:", args.replay_out)
         print("Saved metrics:", args.metrics_out)
+        print("="*50)
 
 
     args:
