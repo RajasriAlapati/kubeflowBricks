@@ -1,546 +1,136 @@
-name: ContinualLearning01
+name: ContinualLearningCNN
 description: |
-  Continual learning using Replay method with a universal previous-model loader.
-  - Loads previous checkpoint (any common format / nested dict / pickled object / directory).
-  - Loads or creates replay buffer, merges with new data.
-  - Trains (fine-tune) the model on merged data.
-  - Saves updated model checkpoint, updated replay buffer, and training metrics.
+  Perform replay-based continual learning for a CNN model.
+  - Loads previous model checkpoint (.pt)
+  - Loads optional replay buffer (first run works without it)
+  - Merges new data with replay memory
+  - Re-trains CNN
+  - Outputs updated model checkpoint + updated replay buffer
 
 inputs:
-  - name: data_path
+  - name: processed_data_pickle
     type: Dataset
-    description: "Pickled dataset (should be a pickled object or file containing new training samples)"
+    description: "Pickled dataset of processed UI components"
+
+  - name: previous_model
+    type: Model
+    description: "Previous CNN checkpoint (.pt). If not provided, trains from scratch"
+
+  - name: previous_replay_buffer
+    type: Dataset
+    description: "Replay buffer pickle. Optional in first run"
 
   - name: config
     type: String
-    description: |
-      JSON config string. Example:
-      {
-        "num_epochs": 10,
-        "batch_size": 32,
-        "learning_rate": 0.001,
-        "replay_buffer_size": 500,
-        "prev_replay_path": "prev_replay.pkl",
-        "prev_checkpoint_path": "prev_model.pt",
-        "replay_sampling": "random"   # or "reservoir"
-      }
-
-  - name: prev_model
-    type: String
-    optional: true
-    description: "Optional path to previous model checkpoint (file or directory)."
+    description: "JSON string: {\"epochs\": 5, \"batch_size\": 32, \"lr\": 0.001, \"memory_size\": 2000}"
 
 outputs:
-  - name: model_path
+  - name: updated_model
     type: Model
-    description: "Updated model checkpoint (state_dict saved)"
 
-  - name: replay_buffer
+  - name: updated_replay_buffer
     type: Dataset
-    description: "Updated replay buffer (pickled)"
-
-  - name: training_metrics
-    type: String
-    description: "JSON metrics for training"
 
 implementation:
   container:
-    image: python:3.10
+    image: python:3.9
     command:
       - sh
       - -c
       - |
-        set -e
-        # Install common ML packages (optional; remove or pin as needed)
         python3 -m pip install --quiet --upgrade pip setuptools wheel
-        python3 -m pip install --quiet "torch" "numpy" "pillow" "torchvision"
-        # Hand over control to the next command in the list
+        python3 -m pip install --quiet "torch==1.13.1+cpu" "torchvision==0.14.1+cpu" -f https://download.pytorch.org/whl/cpu/torch_stable.html
+        python3 -m pip install --quiet pandas numpy scikit-learn
         exec "$0" "$@"
       - python3
       - -u
       - -c
       - |
-        import argparse
-        import json
-        import os
-        import pickle
-        import random
-        import torch
-        import torch.nn as nn
-        import torch.optim as optim
+        import os, json, pickle, torch, random
         import numpy as np
-        from torch.utils.data import DataLoader, TensorDataset
 
-        # ---------- DataWrapper Class ----------
-        class DataWrapper:
-            def __init__(self, data_dict=None):
-                if data_dict:
-                    self.__dict__.update(data_dict)
+        # -----------------------------
+        # Load Inputs
+        # -----------------------------
+        cfg = json.loads(config)
 
-            def __getattr__(self, name):
-                if name in self.__dict__:
-                    return self.__dict__[name]
-                else:
-                    raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+        # Load new dataset
+        with open(processed_data_pickle, "rb") as f:
+            new_data = pickle.load(f)
 
-        # ---------- LabeledDataset Class ----------
-        class LabeledDataset:
-            '''
-            Custom dataset class for handling pickled data.
-            '''
-            def __init__(self, dataset=None, label_mapping=None):
-                self.dataset = dataset or []
-                self.label_mapping = label_mapping or {}
-
-            def __len__(self):
-                try:
-                    if hasattr(self.dataset, '__len__'):
-                        return len(self.dataset)
-                except:
-                    pass
-                return 100
-
-            def __getitem__(self, idx):
-                try:
-                    item = self.dataset[idx]
-                    if isinstance(item, tuple) and len(item) == 2:
-                        data, label = item
-                        return data, label
-                    elif isinstance(item, dict):
-                        data = item.get('image_data')
-                        label = item.get('label', 0)
-                        return data, label
-                except:
-                    pass
-                return torch.randn(3, 224, 224), 0
-
-        # ---------- CustomJSONDataset Class ----------
-        class CustomJSONDataset:
-            '''
-            Added to support loading old checkpoints that were saved with
-            __main__.CustomJSONDataset in the training script.
-            '''
-            def __init__(self, data=None, label_mapping=None):
-                self.data = data or []
-                self.label_mapping = label_mapping or {}
-
-            def __len__(self):
-                try:
-                    return len(self.data)
-                except:
-                    return 100
-
-            def __getitem__(self, idx):
-                try:
-                    item = self.data[idx]
-                    if isinstance(item, tuple):
-                        return item
-                    if isinstance(item, dict):
-                        data = item.get('image_data')
-                        label = item.get('label', 0)
-                        return data, label
-                except:
-                    pass
-                return torch.randn(3, 224, 224), 0
-
-        # ---------- Universal loader ----------
-        def universal_load_state_dict(prev_path):
-            '''
-            Attempts many heuristics to extract a state_dict or dict-like mapping
-            from prev_path. Returns dict-like state_dict or None.
-            '''
-            import os, torch, pickle
-            if not prev_path:
-                return None, "no-path"
-            if os.path.isdir(prev_path):
-                # try common filenames
-                candidates = ["model.pt","model.pth","model.ckpt","trained_model.pt","checkpoint.pt","state_dict.pth"]
-                for c in candidates:
-                    p = os.path.join(prev_path, c)
-                    if os.path.exists(p):
-                        prev_path = p
-                        break
-            try:
-                ckpt = torch.load(prev_path, map_location="cpu")
-            except Exception as e_load:
-                # Try pickle load fallback
-                try:
-                    with open(prev_path, "rb") as f:
-                        ckpt = pickle.load(f)
-                except Exception as e_pickle:
-                    return None, f"both-torch-and-pickle-failed: {e_load} | {e_pickle}"
-
-            # If ckpt is dict
-            if isinstance(ckpt, dict):
-                # common keys
-                for key in ("model_state_dict","state_dict","model"):
-                    if key in ckpt and isinstance(ckpt[key], dict):
-                        return ckpt[key], f"found-key-{key}"
-                # if ckpt itself looks like a state_dict
-                all_tensor_vals = all(hasattr(v,"dtype") or isinstance(v,(torch.Tensor,)) for v in ckpt.values()) if len(ckpt)>0 else False
-                if all_tensor_vals:
-                    return ckpt, "raw-state-dict"
-                # nested: try to find first dict-like value that looks like a state_dict
-                for k,v in ckpt.items():
-                    if isinstance(v, dict):
-                        # check if values look like tensors or arrays
-                        if len(v)>0:
-                            sample = next(iter(v.values()))
-                            if isinstance(sample, (torch.Tensor, np.ndarray)) or hasattr(sample,'dtype'):
-                                return v, f"nested-key-{k}"
-                # not found
-                return None, "dict-but-no-state"
-            # If ckpt is object with state_dict method
-            if hasattr(ckpt, "state_dict"):
-                try:
-                    sd = ckpt.state_dict()
-                    if isinstance(sd, dict):
-                        return sd, "object-state_dict"
-                except Exception as e:
-                    return None, f"object-state-failed:{e}"
-            return None, "unknown-format"
-
-        # ---------- Simple CNN definition ----------
-        class SimpleCNN(nn.Module):
-            def __init__(self, input_channels=3, num_classes=10):
-                super().__init__()
-                self.conv = nn.Sequential(
-                    nn.Conv2d(input_channels, 32, kernel_size=3, padding=1),
-                    nn.ReLU(),
-                    nn.MaxPool2d(2),
-                    nn.Conv2d(32, 64, kernel_size=3, padding=1),
-                    nn.ReLU(),
-                    nn.MaxPool2d(2),
-                )
-                self.fc = nn.Sequential(
-                    nn.Flatten(),
-                    nn.Linear(64 * 8 * 8, 128),
-                    nn.ReLU(),
-                    nn.Linear(128, num_classes)
-                )
-
-            def forward(self, x):
-                return self.fc(self.conv(x))
-
-        # ---------- Enhanced data extraction ----------
-        def extract_data_from_object(data_obj):
-            '''
-            Robustly extract (x, y) data from various pickle formats.
-            Returns: (numpy_x, numpy_y) or raises RuntimeError
-            '''
-            print(f"Data object type: {type(data_obj)}")
-            
-            # Case 1: Direct dict with 'x' and 'y'
-            if isinstance(data_obj, dict):
-                if "x" in data_obj and "y" in data_obj:
-                    print("Found dict with 'x' and 'y' keys")
-                    return np.array(data_obj["x"]), np.array(data_obj["y"])
-                
-                # Check for common alternative keys
-                for x_key in ["data", "images", "X", "inputs", "features"]:
-                    for y_key in ["labels", "targets", "Y", "outputs", "classes"]:
-                        if x_key in data_obj and y_key in data_obj:
-                            print(f"Found dict with '{x_key}' and '{y_key}' keys")
-                            return np.array(data_obj[x_key]), np.array(data_obj[y_key])
-            
-            # Case 2: TensorDataset
-            if hasattr(data_obj, 'tensors'):
-                print("Found TensorDataset")
-                tensors = data_obj.tensors
-                if len(tensors) >= 2:
-                    return tensors[0].numpy(), tensors[1].numpy()
-            
-            # Case 3: Custom dataset objects with extractable attributes
-            for x_attr in ["dataset", "data", "x", "images", "X"]:
-                for y_attr in ["labels", "targets", "y", "Y"]:
-                    if hasattr(data_obj, x_attr) and hasattr(data_obj, y_attr):
-                        print(f"Found object with '{x_attr}' and '{y_attr}' attributes")
-                        x_data = getattr(data_obj, x_attr)
-                        y_data = getattr(data_obj, y_attr)
-                        return np.array(x_data), np.array(y_data)
-            
-            # Case 4: List/tuple of (x, y) pairs
-            try:
-                # Convert to list if needed
-                if hasattr(data_obj, '__iter__') and not isinstance(data_obj, (str, dict)):
-                    data_list = list(data_obj)
-                    if len(data_list) > 0:
-                        first_item = data_list[0]
-                        if isinstance(first_item, (list, tuple)) and len(first_item) >= 2:
-                            print(f"Found list of {len(data_list)} (x, y) tuples")
-                            xs = [np.array(item[0]) for item in data_list]
-                            ys = [int(item[1]) for item in data_list]
-                            return np.array(xs), np.array(ys)
-            except Exception as e:
-                print(f"Failed to extract as list of tuples: {e}")
-            
-            # Case 5: LabeledDataset or CustomJSONDataset
-            if isinstance(data_obj, (LabeledDataset, CustomJSONDataset)):
-                print(f"Found {type(data_obj).__name__}")
-                try:
-                    # Try to extract all items
-                    dataset_attr = getattr(data_obj, 'dataset', None) or getattr(data_obj, 'data', None)
-                    if dataset_attr is not None:
-                        if isinstance(dataset_attr, list):
-                            xs, ys = [], []
-                            for item in dataset_attr:
-                                if isinstance(item, (list, tuple)) and len(item) >= 2:
-                                    xs.append(np.array(item[0]))
-                                    ys.append(int(item[1]))
-                                elif isinstance(item, dict):
-                                    xs.append(np.array(item.get('image_data', item.get('data', []))))
-                                    ys.append(int(item.get('label', 0)))
-                            if xs:
-                                return np.array(xs), np.array(ys)
-                except Exception as e:
-                    print(f"Failed to extract from custom dataset: {e}")
-            
-            # Case 6: Try using __getitem__ if available
-            if hasattr(data_obj, '__getitem__') and hasattr(data_obj, '__len__'):
-                try:
-                    length = len(data_obj)
-                    print(f"Found indexable object with length {length}")
-                    xs, ys = [], []
-                    for i in range(min(length, 10000)):  # Safety limit
-                        try:
-                            item = data_obj[i]
-                            if isinstance(item, (list, tuple)) and len(item) >= 2:
-                                xs.append(np.array(item[0]))
-                                ys.append(int(item[1]))
-                        except Exception:
-                            break
-                    if xs:
-                        return np.array(xs), np.array(ys)
-                except Exception as e:
-                    print(f"Failed to extract via indexing: {e}")
-            
-            # Case 7: Single numpy array (assume labels are 0)
-            try:
-                arr = np.array(data_obj)
-                if arr.ndim >= 2:
-                    print(f"Converted to numpy array with shape {arr.shape}")
-                    return arr, np.zeros(len(arr), dtype=int)
-            except Exception as e:
-                print(f"Failed to convert to numpy array: {e}")
-            
-            # If all else fails
-            raise RuntimeError(
-                f"Unsupported input dataset format. Type: {type(data_obj)}. "
-                f"Available attributes: {dir(data_obj)[:10]}..."
-            )
-
-        # ---------- Replay helper ----------
-        def load_replay_buffer(path):
-            if path and os.path.exists(path):
-                try:
-                    with open(path, "rb") as f:
-                        rb = pickle.load(f)
-                    if isinstance(rb, dict) and "x" in rb and "y" in rb:
-                        return rb["x"], rb["y"]
-                    else:
-                        return rb, None
-                except Exception:
-                    return None, None
-            return None, None
-
-        def save_replay_buffer(path, x_list, y_list):
-            with open(path, "wb") as f:
-                pickle.dump({"x": x_list, "y": y_list}, f)
-
-        # ---------- training ----------
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--data_path", type=str, required=True)
-        parser.add_argument("--config", type=str, required=True)
-        parser.add_argument("--prev_model", type=str, default="")
-        parser.add_argument("--model_path", type=str, required=True)
-        parser.add_argument("--replay_out", type=str, required=True)
-        parser.add_argument("--metrics_out", type=str, required=True)
-        args = parser.parse_args()
-
-        # load config JSON (passed as a string via {inputValue: config})
-        cfg = json.loads(args.config)
-        num_epochs = int(cfg.get("num_epochs", 10))
-        batch_size = int(cfg.get("batch_size", 32))
-        lr = float(cfg.get("learning_rate", 1e-3))
-        replay_buffer_size = int(cfg.get("replay_buffer_size", 500))
-        prev_replay_path = cfg.get("prev_replay_path", "")
-        prev_ckpt_path = cfg.get("prev_checkpoint_path", None) or args.prev_model
-        replay_sampling = cfg.get("replay_sampling", "random")
-
-        # Load new data using robust extraction
-        print(f"Loading data from: {args.data_path}")
-        with open(args.data_path, "rb") as f:
-            data_obj = pickle.load(f)
-
-        try:
-            new_x, new_y = extract_data_from_object(data_obj)
-            print(f"Successfully extracted data. X shape: {new_x.shape}, Y shape: {new_y.shape}")
-        except Exception as e:
-            print(f"Error extracting data: {e}")
-            raise
-
-        # Ensure shapes: new_x shape = (N, C, H, W)
-        # If input is (N, H, W, C) convert
-        if new_x.ndim == 4 and new_x.shape[-1] in (1,3):
-            # NHWC -> NCHW
-            if new_x.shape[-1] in (1,3):
-                print(f"Converting from NHWC to NCHW format")
-                new_x = np.transpose(new_x, (0,3,1,2))
-
-        # If 3D, add channel dimension
-        if new_x.ndim == 3:
-            print("Adding channel dimension to 3D data")
-            new_x = np.expand_dims(new_x, axis=1)
-
-        # cast to float32
-        new_x = new_x.astype(np.float32)
-        new_y = new_y.astype(np.int64)
-
-        # Load replay buffer if exists
-        replay_x, replay_y = None, None
-        if prev_replay_path and os.path.exists(prev_replay_path):
-            try:
-                with open(prev_replay_path, "rb") as f:
-                    rb = pickle.load(f)
-                replay_x = np.array(rb.get("x", []))
-                replay_y = np.array(rb.get("y", []))
-                print(f"Loaded replay buffer: {len(replay_x)} samples")
-            except Exception as e:
-                print(f"Failed to load replay buffer: {e}")
-                replay_x, replay_y = None, None
-
-        # Create model and try to load previous checkpoint with heuristics
-        num_classes = int(cfg.get("num_classes", max(10, int(new_y.max()) + 1)))
-        input_channels = int(cfg.get("input_channels", new_x.shape[1] if new_x.ndim == 4 else 3))
-
-        print(f"Creating model: {input_channels} channels, {num_classes} classes")
-        model = SimpleCNN(input_channels, num_classes)
-
-        # Try universal loader: check prev_ckpt_path, then args.prev_model
-        sd, reason = None, None
-        if prev_ckpt_path:
-            sd, reason = universal_load_state_dict(prev_ckpt_path)
-            # If failed, attempt args.prev_model path
-        if sd is None and args.prev_model:
-            sd, reason = universal_load_state_dict(args.prev_model)
-
-        loaded_any = False
-        if sd is not None:
-            try:
-                model.load_state_dict(sd, strict=False)
-                print(f"=> Loaded state_dict ({reason}), merged with model (strict=False).")
-                loaded_any = True
-            except Exception as e:
-                print("=> state_dict load failed:", e)
-
-        if not loaded_any:
-            print("=> No usable checkpoint/state_dict found or applied. Continuing from init weights.")
-
-        # Merge replay: simple concatenation with optional reservoir sampling
-        if replay_x is None or len(replay_x) == 0:
-            replay_x = np.array([], dtype=new_x.dtype).reshape(0,*new_x.shape[1:])
-            replay_y = np.array([], dtype=new_y.dtype)
-        
-        # Create combined pool
-        combined_x = np.concatenate([new_x, replay_x], axis=0) if len(replay_x)>0 else new_x
-        combined_y = np.concatenate([new_y, replay_y], axis=0) if len(replay_y)>0 else new_y
-
-        # If combined size > replay_buffer_size, keep most recent new_x plus sampled old
-        if len(combined_x) > replay_buffer_size:
-            # keep all new samples first then sample older to fill buffer
-            n_new = len(new_x)
-            keep_new = min(n_new, replay_buffer_size)
-            remaining = replay_buffer_size - keep_new
-            # sample from old (replay_x)
-            if len(replay_x) > 0 and remaining > 0:
-                idxs = list(range(len(replay_x)))
-                if replay_sampling == "random":
-                    sampled = random.sample(idxs, k=min(len(idxs), remaining))
-                else:
-                    sampled = idxs[:remaining]
-                sel_x = replay_x[sampled]
-                sel_y = replay_y[sampled]
-                buf_x = np.concatenate([new_x[:keep_new], sel_x], axis=0)
-                buf_y = np.concatenate([new_y[:keep_new], sel_y], axis=0)
-            else:
-                buf_x = new_x[:replay_buffer_size]
-                buf_y = new_y[:replay_buffer_size]
+        # Load previous replay buffer
+        if previous_replay_buffer and os.path.exists(previous_replay_buffer):
+            with open(previous_replay_buffer, "rb") as f:
+                replay_buffer = pickle.load(f)
         else:
-            buf_x = combined_x
-            buf_y = combined_y
+            replay_buffer = []
 
-        print(f"Final training buffer size: {len(buf_x)} samples")
+        # Load previous model
+        if previous_model and os.path.exists(previous_model):
+            model = torch.load(previous_model, map_location="cpu")
+        else:
+            # ---- CREATE NEW CNN HERE ----
+            import torch.nn as nn
+            class SimpleCNN(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.conv = nn.Sequential(
+                        nn.Conv2d(1, 16, 3, padding=1),
+                        nn.ReLU(),
+                        nn.MaxPool2d(2)
+                    )
+                    self.fc = nn.Sequential(
+                        nn.Flatten(),
+                        nn.Linear(16 * 14 * 14, 10)
+                    )
+                def forward(self, x):
+                    return self.fc(self.conv(x))
+            model = SimpleCNN()
 
-        # Create DataLoader
-        tensor_x = torch.tensor(buf_x, dtype=torch.float32)
-        tensor_y = torch.tensor(buf_y, dtype=torch.long)
-        loader = DataLoader(TensorDataset(tensor_x, tensor_y), batch_size=batch_size, shuffle=True)
+        # -----------------------------
+        # Prepare Replay Memory
+        # -----------------------------
+        memory_limit = cfg.get("memory_size", 2000)
 
-        # Training
-        device = torch.device("cuda" if torch.cuda.is_available() and cfg.get("use_cuda", False) else "cpu")
-        print(f"Using device: {device}")
-        model = model.to(device)
-        optimizer = optim.Adam(model.parameters(), lr=lr)
-        criterion = nn.CrossEntropyLoss()
+        # Add new samples
+        replay_buffer.extend(new_data)
 
-        metrics = {"loss": [], "accuracy": [], "loaded_checkpoint": bool(loaded_any)}
+        # Shuffle once
+        random.shuffle(replay_buffer)
 
-        print(f"Starting training for {num_epochs} epochs...")
-        for epoch in range(num_epochs):
-            model.train()
-            total_loss = 0.0
-            correct = 0
-            total = 0
-            for xb, yb in loader:
-                xb = xb.to(device)
-                yb = yb.to(device)
+        # Trim to memory limit
+        replay_buffer = replay_buffer[:memory_limit]
+
+        # -----------------------------
+        # Convert replay to tensors
+        # -----------------------------
+        X = torch.stack([torch.tensor(d["image"]) for d in replay_buffer]).float()
+        y = torch.tensor([d["label"] for d in replay_buffer]).long()
+
+        dataset = torch.utils.data.TensorDataset(X, y)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=cfg.get("batch_size", 32), shuffle=True)
+
+        # -----------------------------
+        # Training Loop
+        # -----------------------------
+        model.train()
+        optimizer = torch.optim.Adam(model.parameters(), lr=cfg.get("lr", 0.001))
+        loss_fn = torch.nn.CrossEntropyLoss()
+
+        for epoch in range(cfg.get("epochs", 5)):
+            for batch_x, batch_y in loader:
                 optimizer.zero_grad()
-                out = model(xb)
-                loss = criterion(out, yb)
+                pred = model(batch_x)
+                loss = loss_fn(pred, batch_y)
                 loss.backward()
                 optimizer.step()
-                total_loss += loss.item()
-                preds = out.argmax(dim=1)
-                correct += (preds == yb).sum().item()
-                total += yb.size(0)
-            
-            epoch_loss = total_loss / len(loader)
-            epoch_acc = correct / total if total > 0 else 0.0
-            metrics["loss"].append(epoch_loss)
-            metrics["accuracy"].append(epoch_acc)
-            print(f"Epoch {epoch+1}/{num_epochs} - Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.4f}")
 
-        # Save model
-        os.makedirs(os.path.dirname(args.model_path) or ".", exist_ok=True)
-        torch.save(model.state_dict(), args.model_path)
+        # -----------------------------
+        # Save outputs
+        # -----------------------------
+        torch.save(model, updated_model)
 
-        # Save updated replay buffer (buf_x, buf_y)
-        os.makedirs(os.path.dirname(args.replay_out) or ".", exist_ok=True)
-        with open(args.replay_out, "wb") as f:
-            pickle.dump({"x": buf_x, "y": buf_y}, f)
+        with open(updated_replay_buffer, "wb") as f:
+            pickle.dump(replay_buffer, f)
 
-        # Save metrics
-        os.makedirs(os.path.dirname(args.metrics_out) or ".", exist_ok=True)
-        with open(args.metrics_out, "w") as f:
-            json.dump(metrics, f)
-
-        print("="*50)
-        print("Saved model:", args.model_path)
-        print("Saved replay buffer:", args.replay_out)
-        print("Saved metrics:", args.metrics_out)
-        print("="*50)
-
-
-    args:
-      - --data_path
-      - {inputPath: data_path}
-      - --config
-      - {inputValue: config}
-      - --prev_model
-      - {inputPath: prev_model}
-      - --model_path
-      - {outputPath: model_path}
-      - --replay_out
-      - {outputPath: replay_buffer}
-      - --metrics_out
-      - {outputPath: training_metrics}
+        print("Training complete. Model + replay buffer saved.")
