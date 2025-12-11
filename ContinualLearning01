@@ -224,10 +224,10 @@ implementation:
 
         # ---------- Enhanced data extraction ----------
         def extract_data_from_object(data_obj):
-            """
+            '''
             Robustly extract (x, y) data from various pickle formats.
             Returns: (numpy_x, numpy_y) or raises RuntimeError
-            """
+            '''
             print(f"Data object type: {type(data_obj)}")
             
             # Case 1: Direct dict with 'x' and 'y'
