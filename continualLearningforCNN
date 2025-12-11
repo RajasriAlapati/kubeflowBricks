@@ -114,6 +114,35 @@ implementation:
                     pass
                 return torch.randn(3, 224, 224), 0
 
+        # ---------- CustomJSONDataset Class ----------
+        class CustomJSONDataset:
+            '''
+            Added to support loading old checkpoints that were saved with
+            __main__.CustomJSONDataset in the training script.
+            '''
+            def __init__(self, data=None, label_mapping=None):
+                self.data = data or []
+                self.label_mapping = label_mapping or {}
+
+            def __len__(self):
+                try:
+                    return len(self.data)
+                except:
+                    return 100
+
+            def __getitem__(self, idx):
+                try:
+                    item = self.data[idx]
+                    if isinstance(item, tuple):
+                        return item
+                    if isinstance(item, dict):
+                        data = item.get('image_data')
+                        label = item.get('label', 0)
+                        return data, label
+                except:
+                    pass
+                return torch.randn(3, 224, 224), 0
+
         # ---------- Universal loader ----------
         def universal_load_state_dict(prev_path):
             '''
@@ -324,8 +353,8 @@ implementation:
             replay_x = np.array([], dtype=new_x.dtype).reshape(0,*new_x.shape[1:])
             replay_y = np.array([], dtype=new_y.dtype)
         # Create combined pool
-        combined_x = np.concatenate([new_x, replay_x], axis=0) if len(replay_x) > 0 else new_x
-        combined_y = np.concatenate([new_y, replay_y], axis=0) if len(replay_y) > 0 else new_y
+        combined_x = np.concatenate([new_x, replay_x], axis=0) if len(replay_x)>0 else new_x
+        combined_y = np.concatenate([new_y, replay_y], axis=0) if len(replay_y)>0 else new_y
 
         # If combined size > replay_buffer_size, keep most recent new_x plus sampled old
         if len(combined_x) > replay_buffer_size:
@@ -400,6 +429,7 @@ implementation:
         print("Saved model:", args.model_path)
         print("Saved replay buffer:", args.replay_out)
         print("Saved metrics:", args.metrics_out)
+
 
     args:
       - --data_path
