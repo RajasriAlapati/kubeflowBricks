@@ -83,6 +83,37 @@ implementation:
                 else:
                     raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
 
+        # ---------- LabeledDataset Class ----------
+        class LabeledDataset:
+            '''
+            Custom dataset class for handling pickled data.
+            '''
+            def __init__(self, dataset=None, label_mapping=None):
+                self.dataset = dataset or []
+                self.label_mapping = label_mapping or {}
+
+            def __len__(self):
+                try:
+                    if hasattr(self.dataset, '__len__'):
+                        return len(self.dataset)
+                except:
+                    pass
+                return 100
+
+            def __getitem__(self, idx):
+                try:
+                    item = self.dataset[idx]
+                    if isinstance(item, tuple) and len(item) == 2:
+                        data, label = item
+                        return data, label
+                    elif isinstance(item, dict):
+                        data = item.get('image_data')
+                        label = item.get('label', 0)
+                        return data, label
+                except:
+                    pass
+                return torch.randn(3, 224, 224), 0
+
         # ---------- Universal loader ----------
         def universal_load_state_dict(prev_path):
             '''
@@ -94,7 +125,7 @@ implementation:
                 return None, "no-path"
             if os.path.isdir(prev_path):
                 # try common filenames
-                candidates = ["model.pt", "model.pth", "model.ckpt", "trained_model.pt", "checkpoint.pt", "state_dict.pth"]
+                candidates = ["model.pt","model.pth","model.ckpt","trained_model.pt","checkpoint.pt","state_dict.pth"]
                 for c in candidates:
                     p = os.path.join(prev_path, c)
                     if os.path.exists(p):
@@ -113,20 +144,20 @@ implementation:
             # If ckpt is dict
             if isinstance(ckpt, dict):
                 # common keys
-                for key in ("model_state_dict", "state_dict", "model"):
+                for key in ("model_state_dict","state_dict","model"):
                     if key in ckpt and isinstance(ckpt[key], dict):
                         return ckpt[key], f"found-key-{key}"
                 # if ckpt itself looks like a state_dict
-                all_tensor_vals = all(hasattr(v, "dtype") or isinstance(v, (torch.Tensor,)) for v in ckpt.values()) if len(ckpt) > 0 else False
+                all_tensor_vals = all(hasattr(v,"dtype") or isinstance(v,(torch.Tensor,)) for v in ckpt.values()) if len(ckpt)>0 else False
                 if all_tensor_vals:
                     return ckpt, "raw-state-dict"
                 # nested: try to find first dict-like value that looks like a state_dict
-                for k, v in ckpt.items():
+                for k,v in ckpt.items():
                     if isinstance(v, dict):
                         # check if values look like tensors or arrays
-                        if len(v) > 0:
+                        if len(v)>0:
                             sample = next(iter(v.values()))
-                            if isinstance(sample, (torch.Tensor, np.ndarray)) or hasattr(sample, 'dtype'):
+                            if isinstance(sample, (torch.Tensor, np.ndarray)) or hasattr(sample,'dtype'):
                                 return v, f"nested-key-{k}"
                 # not found
                 return None, "dict-but-no-state"
