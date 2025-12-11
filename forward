@@ -17,15 +17,11 @@ implementation:
   container:
     image: gurpreetgandhi/nesy-factory:v30
     command:
-      - python3
-      - -u
+      - sh
       - -c
       - |
-        set -e
-        # Install common ML packages (optional; remove or pin as needed)
         python3 -m pip install --quiet --upgrade pip setuptools wheel
-        python3 -m pip install --quiet "torch" "pillow" "torchvision"
-        # Hand over control to the next command in the list
+        python3 -m pip install --quiet "torchvision" 
         exec "$0" "$@"
       - python3
       - -u
