@@ -26,7 +26,7 @@ implementation:
         from torch.utils.data import TensorDataset, DataLoader
         import nesy_factory.CNNs.ffresnet as ffresnet
 
-        # Define the LabeledDataset class for unpickling
+        # Define the LabeledDataset and CustomJSONDataset classes for unpickling
         class LabeledDataset:
             def __init__(self, *args, **kwargs):
                 obj = None
@@ -59,17 +59,19 @@ implementation:
                     pass
                 return torch.randn(3,224,224), 0
         
-        # Define the DataWrapper class to handle unpickling issue
-        class DataWrapper:
-            def __init__(self, d=None):
-                if d:
-                    self.__dict__.update(d)
+        # Define the CustomJSONDataset class
+        class CustomJSONDataset(LabeledDataset):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                # Add any specific customization you need for your dataset here
 
         # Safe unpickler to load datasets safely
         class SafeUnpickler(pickle.Unpickler):
             def find_class(self, module, name):
                 if name == "LabeledDataset":
                     return LabeledDataset
+                if name == "CustomJSONDataset":
+                    return CustomJSONDataset  # Handle CustomJSONDataset
                 if name == "DataWrapper":
                     return DataWrapper
                 return super().find_class(module, name)
