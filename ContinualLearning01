@@ -135,21 +135,21 @@ implementation:
 
         print("Training complete. Model + replay buffer saved.")
 
-args:
-      - --processed_data_pickle
-      - {inputPath: processed_data_pickle}
-
-      - --previous_model
-      - {inputPath: previous_model}
-
-      - --previous_replay_buffer
-      - {inputPath: previous_replay_buffer}
-
-      - --config
-      - {inputValue: config}
-
-      - --updated_model
-      - {outputPath: updated_model}
-
-      - --updated_replay_buffer
-      - {outputPath: updated_replay_buffer}
+  args:
+        - --processed_data_pickle
+        - {inputPath: processed_data_pickle}
+  
+        - --previous_model
+        - {inputPath: previous_model}
+  
+        - --previous_replay_buffer
+        - {inputPath: previous_replay_buffer}
+  
+        - --config
+        - {inputValue: config}
+  
+        - --updated_model
+        - {outputPath: updated_model}
+  
+        - --updated_replay_buffer
+        - {outputPath: updated_replay_buffer}
