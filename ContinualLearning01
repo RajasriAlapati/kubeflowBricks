@@ -1,28 +1,24 @@
 name: ContinualLearningCNN
 description: |
-  Perform replay-based continual learning for a CNN model.
+  Replay-based continual learning for CNN models.
   - Loads previous model checkpoint (.pt)
   - Loads optional replay buffer (first run works without it)
-  - Merges new data with replay memory
-  - Re-trains CNN
-  - Outputs updated model checkpoint + updated replay buffer
+  - Adds new data into replay memory
+  - Trains CNN using combined memory
+  - Outputs updated model + replay buffer
 
 inputs:
   - name: processed_data_pickle
     type: Dataset
-    description: "Pickled dataset of processed UI components"
 
   - name: previous_model
     type: Model
-    description: "Previous CNN checkpoint (.pt). If not provided, trains from scratch"
 
   - name: previous_replay_buffer
     type: Dataset
-    description: "Replay buffer pickle. Optional in first run"
 
   - name: config
     type: String
-    description: "JSON string: {\"epochs\": 5, \"batch_size\": 32, \"lr\": 0.001, \"memory_size\": 2000}"
 
 outputs:
   - name: updated_model
@@ -47,29 +43,44 @@ implementation:
       - -c
       - |
         import os, json, pickle, torch, random
-        import numpy as np
 
         # -----------------------------
-        # Load Inputs
+        # Parse arguments
         # -----------------------------
-        cfg = json.loads(config)
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--processed_data_pickle", required=True)
+        parser.add_argument("--previous_model", required=False)
+        parser.add_argument("--previous_replay_buffer", required=False)
+        parser.add_argument("--config", required=True)
+        parser.add_argument("--updated_model", required=True)
+        parser.add_argument("--updated_replay_buffer", required=True)
+        args = parser.parse_args()
 
+        cfg = json.loads(args.config)
+
+        # -----------------------------
         # Load new dataset
-        with open(processed_data_pickle, "rb") as f:
+        # -----------------------------
+        with open(args.processed_data_pickle, "rb") as f:
             new_data = pickle.load(f)
 
-        # Load previous replay buffer
-        if previous_replay_buffer and os.path.exists(previous_replay_buffer):
-            with open(previous_replay_buffer, "rb") as f:
+        # -----------------------------
+        # Load replay buffer
+        # -----------------------------
+        if args.previous_replay_buffer and os.path.exists(args.previous_replay_buffer):
+            with open(args.previous_replay_buffer, "rb") as f:
                 replay_buffer = pickle.load(f)
         else:
             replay_buffer = []
 
-        # Load previous model
-        if previous_model and os.path.exists(previous_model):
-            model = torch.load(previous_model, map_location="cpu")
+        # -----------------------------
+        # Load or create the model
+        # -----------------------------
+        if args.previous_model and os.path.exists(args.previous_model):
+            model = torch.load(args.previous_model, map_location="cpu")
         else:
-            # ---- CREATE NEW CNN HERE ----
+            # Define a default CNN architecture
             import torch.nn as nn
             class SimpleCNN(nn.Module):
                 def __init__(self):
@@ -85,25 +96,19 @@ implementation:
                     )
                 def forward(self, x):
                     return self.fc(self.conv(x))
+
             model = SimpleCNN()
 
         # -----------------------------
-        # Prepare Replay Memory
+        # Update replay memory
         # -----------------------------
         memory_limit = cfg.get("memory_size", 2000)
 
-        # Add new samples
         replay_buffer.extend(new_data)
-
-        # Shuffle once
         random.shuffle(replay_buffer)
-
-        # Trim to memory limit
         replay_buffer = replay_buffer[:memory_limit]
 
-        # -----------------------------
         # Convert replay to tensors
-        # -----------------------------
         X = torch.stack([torch.tensor(d["image"]) for d in replay_buffer]).float()
         y = torch.tensor([d["label"] for d in replay_buffer]).long()
 
@@ -111,45 +116,45 @@ implementation:
         loader = torch.utils.data.DataLoader(dataset, batch_size=cfg.get("batch_size", 32), shuffle=True)
 
         # -----------------------------
-        # Training Loop
+        # Training loop
         # -----------------------------
         model.train()
         optimizer = torch.optim.Adam(model.parameters(), lr=cfg.get("lr", 0.001))
         loss_fn = torch.nn.CrossEntropyLoss()
 
         for epoch in range(cfg.get("epochs", 5)):
-            for batch_x, batch_y in loader:
+            for bx, by in loader:
                 optimizer.zero_grad()
-                pred = model(batch_x)
-                loss = loss_fn(pred, batch_y)
+                pred = model(bx)
+                loss = loss_fn(pred, by)
                 loss.backward()
                 optimizer.step()
 
         # -----------------------------
         # Save outputs
         # -----------------------------
-        torch.save(model, updated_model)
+        torch.save(model, args.updated_model)
 
-        with open(updated_replay_buffer, "wb") as f:
+        with open(args.updated_replay_buffer, "wb") as f:
             pickle.dump(replay_buffer, f)
 
-        print("Training complete. Model + replay buffer saved.")
+        print("Continual learning step completed successfully.")
 
-  args:
-        - --processed_data_pickle
-        - {inputPath: processed_data_pickle}
-  
-        - --previous_model
-        - {inputPath: previous_model}
-  
-        - --previous_replay_buffer
-        - {inputPath: previous_replay_buffer}
-  
-        - --config
-        - {inputValue: config}
-  
-        - --updated_model
-        - {outputPath: updated_model}
-  
-        - --updated_replay_buffer
-        - {outputPath: updated_replay_buffer}
+    args:
+      - --processed_data_pickle
+      - {inputPath: processed_data_pickle}
+
+      - --previous_model
+      - {inputPath: previous_model}
+
+      - --previous_replay_buffer
+      - {inputPath: previous_replay_buffer}
+
+      - --config
+      - {inputValue: config}
+
+      - --updated_model
+      - {outputPath: updated_model}
+
+      - --updated_replay_buffer
+      - {outputPath: updated_replay_buffer}
