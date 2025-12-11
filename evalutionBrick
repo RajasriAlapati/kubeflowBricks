@@ -1,0 +1,177 @@
+name: evalutionBrick
+description: Evaluates a Forward-Forward CNN model and outputs performance metrics.
+
+inputs:
+  - name: trained_model
+    type: Model
+  - name: data_path
+    type: Dataset
+  - name: config
+    type: String
+
+outputs:
+  - name: metrics
+    type: Metrics
+  - name: metrics_json
+    type: String
+
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:v30
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import torch
+        import argparse, pickle, json, os, sys, io
+        from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+        print("=== STARTING FF MODEL EVALUATION ===")
+
+        # Importing the model class from nesy_factory
+        import nesy_factory.CNNs.ffresnet as ffresnet
+
+        # Safe dataset unpickler (same as training brick)
+        class SafeUnpickler(pickle.Unpickler):
+            def find_class(self, module, name):
+                if name in ["LabeledDataset", "SimpleDataset", "CustomJSONDataset"]:
+                    return LabeledDataset
+                try:
+                    return super().find_class(module, name)
+                except:
+                    class Dummy:
+                        def __init__(self,*a,**kw): pass
+                        def __call__(self,*a,**kw): return None
+                    return Dummy
+
+        # Labeled Dataset Class
+        class LabeledDataset:
+            def __init__(self, dataset=None):
+                self.dataset = getattr(dataset, "dataset", None) or \
+                               getattr(dataset, "data", None) or \
+                               getattr(dataset, "samples", None) or dataset
+
+            def __len__(self):
+                try: return len(self.dataset)
+                except: return 100
+
+            def __getitem__(self, idx):
+                try:
+                    item = self.dataset[idx]
+                    if isinstance(item, tuple) and len(item) == 2:
+                        return item
+                    if isinstance(item, dict):
+                        return item.get("image_data"), item.get("label", 0)
+                except:
+                    pass
+                return torch.randn(3,224,224), 0
+
+        # Parse arguments (same as training brick)
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--trained_model", required=True)
+        parser.add_argument("--data_path", required=True)
+        parser.add_argument("--config", required=True)
+        parser.add_argument("--metrics", required=True)
+        parser.add_argument("--metrics_json", required=True)
+        args = parser.parse_args()
+
+        # Load processed dataset (same as training brick)
+        with open(args.data_path, "rb") as f:
+            processed = SafeUnpickler(io.BytesIO(f.read())).load()
+
+        test_loader = getattr(processed, "test_loader", None)
+        if test_loader is None:
+            print("ERROR: test_loader missing.")
+            sys.exit(1)
+
+        num_classes = processed.num_classes
+        image_size = processed.image_size
+
+        # Load configuration (same as training brick)
+        cfg = json.loads(args.config)
+        ff_cfg = cfg.get("model", {}).get("forward_forward", {})
+        dropout = ff_cfg.get("dropout", 0.0)
+
+        # Rebuild exact training model (using training config)
+        resnet_cfg = {
+            "input_channels": 3,
+            "output_dim": num_classes,
+            "variant": ff_cfg.get("variant", "resnet50"),
+            "use_forward_forward": ff_cfg.get("use_forward_forward", False),
+            "use_cafo": ff_cfg.get("use_cafo", False),
+            "ff_lr": ff_cfg.get("ff_lr", 0.0001),
+            "ff_epochs_per_block": ff_cfg.get("ff_epochs_per_block", 50),
+            "ff_threshold": ff_cfg.get("threshold", 2.0),
+            "ff_blocks": ff_cfg.get("ff_blocks", 4),
+            "dropout": dropout,
+        }
+
+        # Initialize the model
+        model = ffresnet.PatchedResNet(resnet_cfg)
+
+        # Load the trained model
+        checkpoint = torch.load(args.trained_model, map_location="cpu")
+        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+
+        # Move model to device (same as training brick)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device)
+        model.eval()
+
+        # Initialize criterion
+        criterion = torch.nn.CrossEntropyLoss()
+        all_preds, all_targets = [], []
+        total_loss = 0.0
+
+        # Evaluation loop (same as training brick)
+        with torch.no_grad():
+            for X, y in test_loader:
+                X, y = X.to(device), y.to(device)
+                if X.dtype != torch.float32:
+                    X = X.float()
+
+                logits = model(X)
+                loss = criterion(logits, y)
+                total_loss += loss.item()
+
+                preds = logits.argmax(dim=1)
+                all_preds.extend(preds.cpu().numpy())
+                all_targets.extend(y.cpu().numpy())
+
+        # Compute metrics
+        accuracy = float(accuracy_score(all_targets, all_preds))
+        report = classification_report(all_targets, all_preds, output_dict=True)
+        cm = confusion_matrix(all_targets, all_preds).tolist()
+
+        results = {
+            "accuracy": accuracy,
+            "loss": float(total_loss / len(test_loader)),
+            "classification_report": report,
+            "confusion_matrix": cm,
+            "total_samples": len(all_targets)
+        }
+
+        # Save output metrics
+        os.makedirs(os.path.dirname(args.metrics), exist_ok=True)
+        os.makedirs(os.path.dirname(args.metrics_json), exist_ok=True)
+
+        with open(args.metrics, "w") as f:
+            json.dump(results, f, indent=2)
+
+        with open(args.metrics_json, "w") as f:
+            json.dump(results, f, indent=2)
+
+        print("=== EVALUATION COMPLETE ===")
+        print(json.dumps(results, indent=2))
+
+    args:
+      - --trained_model
+      - {inputPath: trained_model}
+      - --data_path
+      - {inputPath: data_path}
+      - --config
+      - {inputValue: config}
+      - --metrics
+      - {outputPath: metrics}
+      - --metrics_json
+      - {outputPath: metrics_json}
