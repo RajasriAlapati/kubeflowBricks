@@ -1,0 +1,82 @@
+name: forward_forward
+description: Trains a Forward-Forward CNN model using processed UI components dataset and configuration.
+
+inputs:
+  - name: data_path
+    type: Dataset
+  - name: config
+    type: String
+
+outputs:
+  - name: trained_model
+    type: Model
+  - name: training_history
+    type: String
+
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:v30
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import torch
+        import argparse
+        import json
+        import os
+        from model import ResNet  # Assuming your ResNet class is in a file named model.py
+
+        # Parse arguments
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--data_path", required=True)
+        parser.add_argument("--config", required=True)
+        parser.add_argument("--trained_model", required=True)
+        parser.add_argument("--training_history", required=True)
+        args = parser.parse_args()
+
+        # Load the config (which is a JSON string)
+        config = json.loads(args.config)
+        
+        # Model configuration to determine if CAFO or Forward-Forward is enabled
+        use_cafo = config['model'].get('use_cafo', False)
+        use_forward_forward = config['model'].get('use_forward_forward', False)
+
+        if use_cafo and use_forward_forward:
+            raise ValueError("Cannot use both CAFO and Forward-Forward at the same time!")
+
+        if use_cafo:
+            print("Training with CAFO...")
+            # Initialize model with CAFO support
+            model = ResNet(config)
+            model.train_cafo(X_train, y_train)  # Start CAFO training
+        elif use_forward_forward:
+            print("Training with Forward-Forward...")
+            # Initialize model with Forward-Forward support
+            model = ResNet(config)
+            model.train_forward_forward(X_train, y_train)  # Start Forward-Forward training
+        else:
+            print("Training with standard backpropagation...")
+            # Use normal backpropagation with ResNet
+            model = ResNet(config)
+            model.train_standard_backpropagation(X_train, y_train)  # Fallback to regular training
+
+        # Save the trained model and training history
+        torch.save({"model_state_dict": model.state_dict()}, args.trained_model)
+        
+        # Save training history (e.g., losses, metrics)
+        training_history = {"train_loss": model.train_losses, "val_loss": model.val_losses}
+        with open(args.training_history, "w") as f:
+            json.dump(training_history, f, indent=2)
+
+        print("Training completed successfully.")
+        
+    args:
+      - --data_path
+      - {inputPath: data_path}
+      - --config
+      - {inputValue: config}
+      - --trained_model
+      - {outputPath: trained_model}
+      - --training_history
+      - {outputPath: training_history}
