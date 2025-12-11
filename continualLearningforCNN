@@ -53,7 +53,7 @@ implementation:
         set -e
         # Install common ML packages (optional; remove or pin as needed)
         python3 -m pip install --quiet --upgrade pip setuptools wheel
-        python3 -m pip install --quiet "torch" "numpy" "pillow"
+        python3 -m pip install --quiet "torch" "numpy" "pillow" "torchvision"
         # Hand over control to the next command in the list
         exec "$0" "$@"
       - python3
