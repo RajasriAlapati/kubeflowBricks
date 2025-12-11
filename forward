@@ -65,6 +65,12 @@ implementation:
                 super().__init__(*args, **kwargs)
                 # Add any specific customization you need for your dataset here
 
+        class DataWrapper:
+            def __init__(self, d=None):
+                if d:
+                    self.__dict__.update(d)
+
+
         # Safe unpickler to load datasets safely
         class SafeUnpickler(pickle.Unpickler):
             def find_class(self, module, name):
