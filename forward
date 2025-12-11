@@ -21,7 +21,6 @@ implementation:
       - -c
       - |
         python3 -m pip install --quiet --upgrade pip setuptools wheel
-        python3 -m pip install --quiet "torchvision==0.17.0"
         exec "$0" "$@"
       - python3
       - -u
@@ -178,7 +177,7 @@ implementation:
             "input_channels": 3,
             "output_dim": num_classes,
             "variant": ff_cfg.get("variant", "resnet50"),
-            "use_forward_forward": ff_cfg.get("use_forward_forward", False),
+            "use_forward_forward": ff_cfg.get("use_forward_forward", True),
             "use_cafo": ff_cfg.get("use_cafo", False),
             "ff_lr": ff_cfg.get("ff_lr", 0.0001),
             "ff_epochs_per_block": ff_cfg.get("ff_epochs_per_block", 50),
@@ -200,7 +199,7 @@ implementation:
                 y_val.to(device) if y_val is not None else None,
                 verbose=True
             )
-        elif ff_cfg.get("use_forward_forward", False):
+        elif ff_cfg.get("use_forward_forward", True):
             print("Training with Forward-Forward...")
             results = net.train_forward_forward(
                 X_train.to(device),
