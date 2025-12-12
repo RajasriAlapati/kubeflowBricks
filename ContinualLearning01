@@ -37,7 +37,7 @@ implementation:
         set -e
         # Install common ML packages (optional; remove or pin as needed)
         python3 -m pip install --quiet --upgrade pip setuptools wheel
-        python3 -m pip install --quiet "torch" "torchvision==0.17.0" "numpy" "pillow"
+        python3 -m pip install --quiet "numpy<2,>=1.22" "pillow" "torch" "torchvision==0.17.0"
         # Hand over control to the next command in the list
         exec "$0" "$@"
       - python3
