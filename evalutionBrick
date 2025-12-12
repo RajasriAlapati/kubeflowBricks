@@ -191,10 +191,10 @@ implementation:
 
         # KFP Metrics File
         with open(args.metrics, "w") as f:
-            f.write(f"accuracy: {accuracy}\nloss: {total_loss / len(test_loader)}\n")
+            f.write(f"accuracy: {accuracy}loss: {total_loss / len(test_loader)}")
 
-        print(" EVAL ")
-        print(json.dumps(results, indent=2))
+        message = "evaluted"
+        print(message)
 
 
     args:
