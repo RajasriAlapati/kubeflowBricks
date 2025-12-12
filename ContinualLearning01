@@ -1,5 +1,5 @@
 name: ContinualLearningCNN
-description: Replay-based continual learning for CNN models (fixed: DataWrapper unpickle, numpy/torch compatibility).
+description: Replay-based continual learning for CNN models.
 
 inputs:
   - name: processed_data_pickle
@@ -34,22 +34,35 @@ implementation:
       - sh
       - -c
       - |
+        set -e
+        # Install common ML packages (optional; remove or pin as needed)
         python3 -m pip install --quiet --upgrade pip setuptools wheel
         python3 -m pip install --quiet "numpy<2,>=1.22" "pillow" "torch" "torchvision==0.17.0"
+        # Hand over control to the next command in the list
         exec "$0" "$@"
       - python3
       - -u
       - -c
       - |
-        import os, json, torch, pickle, argparse, random, traceback, sys
+        import os, json, torch, pickle, argparse, random
         import torch.nn as nn
         import torch.optim as optim
 
-        # ---------------------------
-        # Define classes BEFORE unpickling
-        # (these must exist with the same names the pickle expects)
-        # ---------------------------
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--processed_data_pickle")
+        parser.add_argument("--previous_model", required=False)
+        parser.add_argument("--previous_replay_buffer", required=False)
+        parser.add_argument("--config_str")
+        parser.add_argument("--updated_model")
+        parser.add_argument("--updated_replay_buffer")
+        parser.add_argument("--training_report")
+        args = parser.parse_args()
 
+        # -------------------------------
+        # === ADDED: dataset / wrapper classes required for unpickling ===
+        # These must be present in the module globals before pickle.load(...)
+        # (You requested these exact classes and no other changes.)
+        # -------------------------------
         class LabeledDataset:
             def __init__(self, *args, **kwargs):
                 obj = None
@@ -80,310 +93,174 @@ implementation:
                         return item.get("image_data"), item.get("label", 0)
                 except:
                     pass
-                # fallback: random tensor + label 0
                 return torch.randn(3,224,224), 0
 
+        # Define the CustomJSONDataset class
         class CustomJSONDataset(LabeledDataset):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
-                # place for custom dataset behavior
+                # Add any specific customization you need for your dataset here
 
         class DataWrapper:
             def __init__(self, d=None):
-                if isinstance(d, dict):
+                if d:
                     self.__dict__.update(d)
-                else:
-                    # safe defaults if non-dict passed
-                    self.train_loader = None
-                    self.test_loader = None
-                    self.num_classes = None
-                    self.class_names = None
-                    self.label_to_idx = None
-                    self.image_size = None
-                    self.batch_size = None
-                    self.dataset_info = None
+        # -------------------------------
+        # === end of added classes ===
+        # -------------------------------
 
-        # ---------------------------
-        # Arg parsing
-        # ---------------------------
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--processed_data_pickle")
-        parser.add_argument("--previous_model", required=False)
-        parser.add_argument("--previous_replay_buffer", required=False)
-        parser.add_argument("--config_str", required=False, default="")
-        parser.add_argument("--updated_model")
-        parser.add_argument("--updated_replay_buffer")
-        parser.add_argument("--training_report")
-        args = parser.parse_args()
+        # -------------------------------------------------------
+        # Load config
+        # -------------------------------------------------------
+        cfg = json.loads(args.config_str)
 
-        # Ensure parent directories for outputs exist
-        def ensure_parent(path):
-            try:
-                p = os.path.dirname(path)
-                if p:
-                    os.makedirs(p, exist_ok=True)
-            except Exception:
-                pass
+        replay_size = cfg["training"].get("replay_buffer_size", 500)
+        batch_size = cfg["training"].get("batch_size", 32)
+        lr = cfg["training"].get("optimizer").get("learning_rate", 0.001)
+        epochs = cfg["training"].get("epochs", 3)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        ensure_parent(args.updated_model)
-        ensure_parent(args.updated_replay_buffer)
-        ensure_parent(args.training_report)
+        # -------------------------------------------------------
+        # Load new processed data
+        # -------------------------------------------------------
+        with open(args.processed_data_pickle, "rb") as f:
+            processed = pickle.load(f)
 
-        # Default config
-        default_cfg = {
-            "training": {
-                "replay_buffer_size": 500,
-                "batch_size": 32,
-                "optimizer": {"learning_rate": 0.001},
-                "epochs": 3
-            },
-            "preprocessing": {"image_size": 224}
-        }
+        train_loader = processed.train_loader
+        num_classes = processed.num_classes
 
-        # Load config safely
-        cfg = default_cfg
-        try:
-            if args.config_str and args.config_str.strip():
-                cfg = json.loads(args.config_str)
-            else:
-                print("No config_str provided — using default config.")
-        except Exception as e:
-            print("Failed to parse config_str, using default config. Error:", e)
-            cfg = default_cfg
+        # -------------------------------------------------------
+        # Build Model
+        # -------------------------------------------------------
+        class SimpleCNN(nn.Module):
+            def __init__(self, num_classes):
+                super().__init__()
+                self.features = nn.Sequential(
+                    nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+                    nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2)
+                )
+                self.classifier = nn.Sequential(
+                    nn.Flatten(),
+                    nn.Linear(64*56*56, 128),
+                    nn.ReLU(),
+                    nn.Linear(128, num_classes)
+                )
 
-        # Extract hyperparams with fallbacks
-        try:
-            replay_size = int(cfg.get("training", {}).get("replay_buffer_size", 500))
-            batch_size = int(cfg.get("training", {}).get("batch_size", 32))
-            lr = float(cfg.get("training", {}).get("optimizer", {}).get("learning_rate", 0.001))
-            epochs = int(cfg.get("training", {}).get("epochs", 3))
-        except Exception as e:
-            print("Invalid config values, falling back to defaults. Error:", e)
-            replay_size = 500
-            batch_size = 32
-            lr = 0.001
-            epochs = 3
+            def forward(self, x):
+                x = self.features(x)
+                return self.classifier(x)
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Device: {device}, epochs={epochs}, batch_size={batch_size}, replay_size={replay_size}, lr={lr}")
+        model = SimpleCNN(num_classes).to(device)
 
-        report = {"status": "started", "errors": [], "epochs": 0, "loss_per_epoch": []}
+        # -------------------------------------------------------
+        # Load previous model (optional)
+        # -------------------------------------------------------
+        if args.previous_model and os.path.exists(args.previous_model):
+            print("Loading previous model checkpoint")
+            model.load_state_dict(torch.load(args.previous_model, map_location=device))
+        else:
+            print("No previous model provided — training from scratch")
 
-        try:
-            # ---------------------------
-            # Load processed data (unpickle)
-            # ---------------------------
-            if not args.processed_data_pickle or not os.path.exists(args.processed_data_pickle):
-                raise FileNotFoundError(f"processed_data_pickle not found: {args.processed_data_pickle}")
+        # -------------------------------------------------------
+        # Load previous replay buffer (optional)
+        # -------------------------------------------------------
+        replay_buffer = []
 
-            with open(args.processed_data_pickle, "rb") as f:
-                processed = pickle.load(f)
+        if args.previous_replay_buffer and os.path.exists(args.previous_replay_buffer):
+            print("Loading previous replay buffer")
+            with open(args.previous_replay_buffer, "rb") as f:
+                replay_buffer = pickle.load(f)
+        else:
+            print("No previous replay buffer provided")
 
-            # allow if processed is plain dict-like
-            if isinstance(processed, dict):
-                processed = DataWrapper(processed)
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        loss_fn = nn.CrossEntropyLoss()
 
-            if not hasattr(processed, "train_loader"):
-                raise ValueError("processed_data_pickle does not contain train_loader")
+        # -------------------------------------------------------
+        # Convert replay buffer → DataLoader
+        # -------------------------------------------------------
+        def build_replay_loader(buffer):
+            if len(buffer) == 0:
+                return None
 
-            train_loader = processed.train_loader
-            num_classes = int(getattr(processed, "num_classes", 2))
+            tensor_x = torch.stack([item[0] for item in buffer])
+            tensor_y = torch.tensor([item[1] for item in buffer])
 
-            # ---------------------------
-            # Build a robust Simple CNN
-            # ---------------------------
-            class SimpleCNN(nn.Module):
-                def __init__(self, num_classes):
-                    super().__init__()
-                    self.features = nn.Sequential(
-                        nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-                        nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2)
-                    )
-                    # expecting 224x224 input -> after two poolings -> 56x56
-                    self.classifier = nn.Sequential(
-                        nn.Flatten(),
-                        nn.Linear(64 * 56 * 56, 128),
-                        nn.ReLU(),
-                        nn.Linear(128, num_classes)
-                    )
-                def forward(self, x):
-                    x = self.features(x)
-                    return self.classifier(x)
+            ds = torch.utils.data.TensorDataset(tensor_x, tensor_y)
+            return torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
 
-            model = SimpleCNN(num_classes).to(device)
-            print("Model initialized with num_classes =", num_classes)
+        replay_loader = build_replay_loader(replay_buffer)
 
-            # ---------------------------
-            # Load previous model if provided (state_dict)
-            # ---------------------------
-            if args.previous_model and os.path.exists(args.previous_model):
-                try:
-                    sd = torch.load(args.previous_model, map_location=device)
-                    if isinstance(sd, dict) and "model_state_dict" in sd:
-                        sd = sd["model_state_dict"]
-                    model.load_state_dict(sd, strict=False)
-                    print("Loaded previous model (strict=False).")
-                except Exception as e:
-                    print("Warning: failed to load previous model; continuing with fresh model. Error:", e)
-                    report["errors"].append(f"previous_model_load_error: {str(e)}")
+        # -------------------------------------------------------
+        # Training loop with replay
+        # -------------------------------------------------------
+        def sample_batch(loader):
+            for batch in loader:
+                yield batch
 
-            # ---------------------------
-            # Load previous replay buffer (optional)
-            # ---------------------------
-            replay_buffer = []
-            if args.previous_replay_buffer and os.path.exists(args.previous_replay_buffer):
-                try:
-                    with open(args.previous_replay_buffer, "rb") as f:
-                        replay_buffer = pickle.load(f)
-                    print(f"Loaded previous replay buffer: {len(replay_buffer)} items")
-                except Exception as e:
-                    print("Warning: failed to load previous_replay_buffer; starting empty. Error:", e)
-                    report["errors"].append(f"previous_replay_buffer_load_error: {str(e)}")
-                    replay_buffer = []
-            else:
-                print("No previous_replay_buffer provided; starting empty buffer.")
+        report = {"epochs": epochs, "loss_per_epoch": []}
 
-            # Normalize replay buffer items -> (tensor, int)
-            normalized_buffer = []
-            for item in replay_buffer:
-                try:
-                    if isinstance(item, dict):
-                        img = item.get("image")
-                        lbl = int(item.get("label"))
-                    else:
-                        img, lbl = item
-                    if not isinstance(img, torch.Tensor):
-                        img = torch.tensor(img)
-                    normalized_buffer.append((img, int(lbl)))
-                except Exception:
-                    continue
-            replay_buffer = normalized_buffer
-            print("Replay buffer normalized length:", len(replay_buffer))
+        for ep in range(epochs):
+            model.train()
+            total_loss = 0
 
-            # Replay loader builder
-            def build_replay_loader(buffer):
-                if not buffer:
-                    return None
-                X = torch.stack([t[0] for t in buffer]).float()
-                y = torch.tensor([t[1] for t in buffer]).long()
-                ds = torch.utils.data.TensorDataset(X, y)
-                return torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
+            # Mix replay + new data
+            loaders = []
+            if replay_loader:
+                loaders.append(sample_batch(replay_loader))
+            loaders.append(sample_batch(train_loader))
 
-            replay_loader = build_replay_loader(replay_buffer)
+            for loader in loaders:
+                for x, y in loader:
+                    x, y = x.to(device), y.to(device)
 
-            # ---------------------------
-            # Training loop (replay first, then new data)
-            # ---------------------------
-            optimizer = optim.Adam(model.parameters(), lr=lr)
-            loss_fn = nn.CrossEntropyLoss()
-            report["status"] = "training"
-            report["epochs"] = epochs
-
-            for ep in range(epochs):
-                model.train()
-                epoch_loss = 0.0
-                n_steps = 0
-
-                if replay_loader:
-                    for bx, by in replay_loader:
-                        bx, by = bx.to(device), by.to(device)
-                        optimizer.zero_grad()
-                        out = model(bx)
-                        loss = loss_fn(out, by)
-                        loss.backward()
-                        optimizer.step()
-                        epoch_loss += loss.item()
-                        n_steps += 1
-
-                for bx, by in train_loader:
-                    bx, by = bx.to(device), by.to(device)
                     optimizer.zero_grad()
-                    out = model(bx)
-                    loss = loss_fn(out, by)
+                    out = model(x)
+                    loss = loss_fn(out, y)
                     loss.backward()
                     optimizer.step()
-                    epoch_loss += loss.item()
-                    n_steps += 1
 
-                avg_loss = epoch_loss / n_steps if n_steps > 0 else 0.0
-                report["loss_per_epoch"].append(avg_loss)
-                print(f"Epoch {ep+1}/{epochs} avg_loss={avg_loss:.4f}")
+                    total_loss += loss.item()
 
-            # ---------------------------
-            # Update replay buffer: sample newly seen items from train_loader
-            # ---------------------------
-            new_items = []
-            for bx, by in train_loader:
-                for i in range(bx.size(0)):
-                    try:
-                        new_items.append((bx[i].cpu(), int(by[i].item())))
-                    except Exception:
-                        continue
+            avg_loss = total_loss
+            report["loss_per_epoch"].append(avg_loss)
+            print(f"Epoch {ep+1}/{epochs} - Loss={avg_loss}")
 
-            combined = replay_buffer + new_items
-            random.shuffle(combined)
-            combined = combined[:replay_size]
+        # -------------------------------------------------------
+        # Update replay buffer
+        # -------------------------------------------------------
+        # Extract random samples from new data
+        new_buffer_items = []
 
-            # ---------------------------
-            # Save updated replay buffer
-            # ---------------------------
-            try:
-                with open(args.updated_replay_buffer, "wb") as f:
-                    pickle.dump(combined, f)
-                print("Saved updated_replay_buffer:", args.updated_replay_buffer)
-            except Exception as e:
-                print("Warning: failed to save replay buffer:", e)
-                report["errors"].append(f"save_replay_error: {str(e)}")
+        for x, y in train_loader:
+            for i in range(len(x)):
+                new_buffer_items.append((x[i].cpu(), int(y[i])))
 
-            # ---------------------------
-            # Save model state_dict
-            # ---------------------------
-            try:
-                torch.save(model.state_dict(), args.updated_model)
-                print("Saved updated_model (state_dict) to:", args.updated_model)
-            except Exception as e:
-                print("Warning: failed to save model:", e)
-                report["errors"].append(f"save_model_error: {str(e)}")
+        # Merge old + new
+        combined = replay_buffer + new_buffer_items
 
-            report["status"] = "success"
-            report["final_replay_size"] = len(combined)
-            report["device"] = str(device)
-            report["num_classes"] = num_classes
-            report["used_cfg"] = cfg
+        # Keep replay size fixed
+        random.shuffle(combined)
+        combined = combined[:replay_size]
 
-            # ---------------------------
-            # Save training report
-            # ---------------------------
-            try:
-                with open(args.training_report, "w") as f:
-                    json.dump(report, f, indent=2)
-                print("Saved training_report to:", args.training_report)
-            except Exception as e:
-                print("Warning: failed to save training report:", e)
-                print(json.dumps(report, indent=2))
+        # -------------------------------------------------------
+        # Save updated replay buffer
+        # -------------------------------------------------------
+        with open(args.updated_replay_buffer, "wb") as f:
+            pickle.dump(combined, f)
 
-        except Exception as e_main:
-            tb = traceback.format_exc()
-            print("Fatal error during continual learning brick:", e_main)
-            print(tb)
-            report["status"] = "failed"
-            report["errors"].append(str(e_main))
-            report["traceback"] = tb
-            try:
-                with open(args.training_report, "w") as f:
-                    json.dump(report, f, indent=2)
-            except Exception:
-                pass
-            try:
-                torch.save({}, args.updated_model)
-            except Exception:
-                pass
-            try:
-                with open(args.updated_replay_buffer, "wb") as f:
-                    pickle.dump([], f)
-            except Exception:
-                pass
-            sys.exit(1)
+        # -------------------------------------------------------
+        # Save updated model
+        # -------------------------------------------------------
+        torch.save(model.state_dict(), args.updated_model)
+
+        # -------------------------------------------------------
+        # Save training report
+        # -------------------------------------------------------
+        with open(args.training_report, "w") as f:
+            json.dump(report, f, indent=2)
+
+        print("Continual Learning update complete!")
     args:
       - --processed_data_pickle
       - {inputPath: processed_data_pickle}
