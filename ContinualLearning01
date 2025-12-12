@@ -11,7 +11,7 @@ inputs:
     optional: true
 
   - name: previous_replay_buffer
-    type: Dataset
+    type: String
     description: "Optional previous replay buffer pickle"
     optional: true
 
