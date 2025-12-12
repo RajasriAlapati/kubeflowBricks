@@ -24,36 +24,34 @@ implementation:
       - -c
       - |
         import torch
-        import argparse, pickle, json, os, sys, io
+        import argparse, pickle, json, os, io
         from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+        import nesy_factory.CNNs.ffresnet as ffresnet
         print("=== STARTING FF MODEL EVALUATION ===")
 
-        # Importing necessary libraries and classes
-        import nesy_factory.CNNs.ffresnet as ffresnet
-
-        # Safe dataset unpickler (same as training brick)
-        class SafeUnpickler(pickle.Unpickler):
-            def find_class(self, module, name):
-                if name in ["LabeledDataset", "SimpleDataset", "CustomJSONDataset"]:
-                    return LabeledDataset
-                try:
-                    return super().find_class(module, name)
-                except:
-                    class Dummy:
-                        def __init__(self,*a,**kw): pass
-                        def __call__(self,*a,**kw): return None
-                    return Dummy
-
-        # Labeled Dataset Class
+        # ---------------------------------------------------------------------
+        # 1. SAFE DATASET UNPICKLER (MATCHING TRAIN BRICK EXACTLY)
+        # ---------------------------------------------------------------------
         class LabeledDataset:
-            def __init__(self, dataset=None):
-                self.dataset = getattr(dataset, "dataset", None) or \
-                               getattr(dataset, "data", None) or \
-                               getattr(dataset, "samples", None) or dataset
+            def __init__(self, *args, **kwargs):
+                obj = None
+                if "dataset" in kwargs:
+                    obj = kwargs["dataset"]
+                elif len(args) == 1:
+                    obj = args[0]
+                else:
+                    obj = kwargs
+
+                self.dataset = getattr(obj, "dataset", None) or \
+                               getattr(obj, "data", None) or \
+                               getattr(obj, "samples", None) or \
+                               obj
 
             def __len__(self):
-                try: return len(self.dataset)
-                except: return 100
+                try:
+                    return len(self.dataset)
+                except:
+                    return 100
 
             def __getitem__(self, idx):
                 try:
@@ -65,50 +63,43 @@ implementation:
                 except:
                     pass
                 return torch.randn(3,224,224), 0
+        
+        class CustomJSONDataset(LabeledDataset):
+            pass
 
-        # Patch imports and initialize base CNN class (same as in training brick)
+        class DataWrapper:
+            def __init__(self, d=None):
+                if d:
+                    self.__dict__.update(d)
+
+        class SafeUnpickler(pickle.Unpickler):
+            def find_class(self, module, name):
+                if name == "LabeledDataset":
+                    return LabeledDataset
+                if name == "CustomJSONDataset":
+                    return CustomJSONDataset
+                if name == "DataWrapper":
+                    return DataWrapper
+                try:
+                    return super().find_class(module, name)
+                except:
+                    class Dummy: 
+                        pass
+                    return Dummy
+
+        # ---------------------------------------------------------------------
+        # 2. PATCHED RESNET (SAME AS TRAINING BRICK)
+        # ---------------------------------------------------------------------
         class PatchedResNet(ffresnet.ResNet):
             def __init__(self, config):
                 setattr(self, "dropout", config.get("dropout", 0.0))
                 super().__init__(config)
 
-            # Evaluation method for Forward-Forward (as it's already trained)
-            def eval_model(self, test_loader, criterion, device):
-                self.eval()
-                all_preds, all_targets = [], []
-                total_loss = 0.0
+        ResNet = PatchedResNet
 
-                # Evaluation loop (same as in training brick)
-                with torch.no_grad():
-                    for X, y in test_loader:
-                        X, y = X.to(device), y.to(device)
-                        if X.dtype != torch.float32:
-                            X = X.float()
-
-                        logits = self(X)
-                        loss = criterion(logits, y)
-                        total_loss += loss.item()
-
-                        preds = logits.argmax(dim=1)
-                        all_preds.extend(preds.cpu().numpy())
-                        all_targets.extend(y.cpu().numpy())
-
-                # Compute metrics
-                accuracy = float(accuracy_score(all_targets, all_preds))
-                report = classification_report(all_targets, all_preds, output_dict=True)
-                cm = confusion_matrix(all_targets, all_preds).tolist()
-
-                results = {
-                    "accuracy": accuracy,
-                    "loss": float(total_loss / len(test_loader)),
-                    "classification_report": report,
-                    "confusion_matrix": cm,
-                    "total_samples": len(all_targets)
-                }
-
-                return results
-
-        # Parse arguments
+        # ---------------------------------------------------------------------
+        # 3. PARSE ARGS
+        # ---------------------------------------------------------------------
         parser = argparse.ArgumentParser()
         parser.add_argument("--trained_model", required=True)
         parser.add_argument("--data_path", required=True)
@@ -117,66 +108,92 @@ implementation:
         parser.add_argument("--metrics_json", required=True)
         args = parser.parse_args()
 
-        # Load processed dataset (same as training brick)
+        # ---------------------------------------------------------------------
+        # 4. LOAD DATASET (MATCH TRAIN BRICK STRUCTURE)
+        # ---------------------------------------------------------------------
         with open(args.data_path, "rb") as f:
             processed = SafeUnpickler(io.BytesIO(f.read())).load()
 
-        test_loader = getattr(processed, "test_loader", None)
-        if test_loader is None:
-            print("ERROR: test_loader missing.")
-            sys.exit(1)
-
+        test_loader = processed.test_loader
         num_classes = processed.num_classes
-        image_size = processed.image_size
 
-        # Load configuration (same as training brick)
+        # ---------------------------------------------------------------------
+        # 5. LOAD CONFIG FOR RESNET (MATCH TRAIN BRICK)
+        # ---------------------------------------------------------------------
         cfg = json.loads(args.config)
         ff_cfg = cfg.get("model", {}).get("forward_forward", {})
-        dropout = ff_cfg.get("dropout", 0.0)
 
-        # Rebuild exact training model (using training config)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         resnet_cfg = {
             "input_channels": 3,
             "output_dim": num_classes,
             "variant": ff_cfg.get("variant", "resnet50"),
-            "use_forward_forward": ff_cfg.get("use_forward_forward", False),
+            "use_forward_forward": ff_cfg.get("use_forward_forward", True),
             "use_cafo": ff_cfg.get("use_cafo", False),
             "ff_lr": ff_cfg.get("ff_lr", 0.0001),
             "ff_epochs_per_block": ff_cfg.get("ff_epochs_per_block", 50),
             "ff_threshold": ff_cfg.get("threshold", 2.0),
             "ff_blocks": ff_cfg.get("ff_blocks", 4),
-            "dropout": dropout,
+            "dropout": ff_cfg.get("dropout", 0.0),
+            "device": str(device),
         }
 
-        # Initialize the model
-        model = PatchedResNet(resnet_cfg)
+        print("Loading FF-ResNet model...")
+        model = ResNet(resnet_cfg).to(device)
 
-        # Load the trained model
-        checkpoint = torch.load(args.trained_model, map_location="cpu")
-        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        ckpt = torch.load(args.trained_model, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        model.eval()
 
-        # Move model to device (same as training brick)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = model.to(device)
-
-        # Initialize criterion
         criterion = torch.nn.CrossEntropyLoss()
 
-        # Evaluate the model
-        results = model.eval_model(test_loader, criterion, device)
+        # ---------------------------------------------------------------------
+        # 6. EVALUATION LOOP
+        # ---------------------------------------------------------------------
+        all_preds = []
+        all_targets = []
+        total_loss = 0.0
 
-        # Save output metrics
-        os.makedirs(os.path.dirname(args.metrics), exist_ok=True)
-        os.makedirs(os.path.dirname(args.metrics_json), exist_ok=True)
+        with torch.no_grad():
+            for X, y in test_loader:
+                X, y = X.to(device), y.to(device)
+                if X.dtype != torch.float32:
+                    X = X.float()
 
-        with open(args.metrics, "w") as f:
-            json.dump(results, f, indent=2)
+                logits = model(X)
+                loss = criterion(logits, y)
+                total_loss += loss.item()
 
+                preds = logits.argmax(dim=1)
+                all_preds.extend(preds.cpu().tolist())
+                all_targets.extend(y.cpu().tolist())
+
+        # ---------------------------------------------------------------------
+        # 7. METRICS
+        # ---------------------------------------------------------------------
+        accuracy = accuracy_score(all_targets, all_preds)
+        report = classification_report(all_targets, all_preds, digits=4)
+        cm = confusion_matrix(all_targets, all_preds)
+
+        metrics_output = {
+            "accuracy": accuracy,
+            "confusion_matrix": cm.tolist(),
+            "classification_report": report,
+            "loss": total_loss / len(test_loader)
+        }
+
+        # ---------------------------------------------------------------------
+        # 8. SAVE OUTPUTS FOR KFP
+        # ---------------------------------------------------------------------
         with open(args.metrics_json, "w") as f:
-            json.dump(results, f, indent=2)
+            json.dump(metrics_output, f, indent=2)
+
+        # KFP Metrics File
+        with open(args.metrics, "w") as f:
+            f.write(f"accuracy: {accuracy}\nloss: {total_loss / len(test_loader)}\n")
 
         print("=== EVALUATION COMPLETE ===")
-        print(json.dumps(results, indent=2))
 
     args:
       - --trained_model
