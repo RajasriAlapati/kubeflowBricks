@@ -182,6 +182,7 @@ implementation:
             "classification_report": report,
             "loss": total_loss / len(test_loader)
         }
+        print(" EVAL ")
 
         # ---------------------------------------------------------------------
         # 8. SAVE OUTPUTS FOR KFP
@@ -193,7 +194,6 @@ implementation:
         with open(args.metrics, "w") as f:
             f.write(f"accuracy: {accuracy}\nloss: {total_loss / len(test_loader)}\n")
 
-        print("=== EVALUATION COMPLETE ===")
 
     args:
       - --trained_model
