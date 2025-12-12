@@ -182,7 +182,6 @@ implementation:
             "classification_report": report,
             "loss": total_loss / len(test_loader)
         }
-        print(" EVAL ")
 
         # ---------------------------------------------------------------------
         # 8. SAVE OUTPUTS FOR KFP
@@ -193,6 +192,9 @@ implementation:
         # KFP Metrics File
         with open(args.metrics, "w") as f:
             f.write(f"accuracy: {accuracy}\nloss: {total_loss / len(test_loader)}\n")
+
+        print(" EVAL ")
+        print(json.dumps(results, indent=2))
 
 
     args:
