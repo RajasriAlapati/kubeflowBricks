@@ -1,4 +1,4 @@
-name: evalutionBrick
+name: evaluationBrick
 description: Evaluates a Forward-Forward CNN model and outputs performance metrics.
 
 inputs:
@@ -28,7 +28,7 @@ implementation:
         from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
         print("=== STARTING FF MODEL EVALUATION ===")
 
-        # Importing the model class from nesy_factory
+        # Importing necessary libraries and classes
         import nesy_factory.CNNs.ffresnet as ffresnet
 
         # Safe dataset unpickler (same as training brick)
@@ -66,7 +66,49 @@ implementation:
                     pass
                 return torch.randn(3,224,224), 0
 
-        # Parse arguments (same as training brick)
+        # Patch imports and initialize base CNN class (same as in training brick)
+        class PatchedResNet(ffresnet.ResNet):
+            def __init__(self, config):
+                setattr(self, "dropout", config.get("dropout", 0.0))
+                super().__init__(config)
+
+            # Evaluation method for Forward-Forward (as it's already trained)
+            def eval_model(self, test_loader, criterion, device):
+                self.eval()
+                all_preds, all_targets = [], []
+                total_loss = 0.0
+
+                # Evaluation loop (same as in training brick)
+                with torch.no_grad():
+                    for X, y in test_loader:
+                        X, y = X.to(device), y.to(device)
+                        if X.dtype != torch.float32:
+                            X = X.float()
+
+                        logits = self(X)
+                        loss = criterion(logits, y)
+                        total_loss += loss.item()
+
+                        preds = logits.argmax(dim=1)
+                        all_preds.extend(preds.cpu().numpy())
+                        all_targets.extend(y.cpu().numpy())
+
+                # Compute metrics
+                accuracy = float(accuracy_score(all_targets, all_preds))
+                report = classification_report(all_targets, all_preds, output_dict=True)
+                cm = confusion_matrix(all_targets, all_preds).tolist()
+
+                results = {
+                    "accuracy": accuracy,
+                    "loss": float(total_loss / len(test_loader)),
+                    "classification_report": report,
+                    "confusion_matrix": cm,
+                    "total_samples": len(all_targets)
+                }
+
+                return results
+
+        # Parse arguments
         parser = argparse.ArgumentParser()
         parser.add_argument("--trained_model", required=True)
         parser.add_argument("--data_path", required=True)
@@ -107,7 +149,7 @@ implementation:
         }
 
         # Initialize the model
-        model = ffresnet.PatchedResNet(resnet_cfg)
+        model = PatchedResNet(resnet_cfg)
 
         # Load the trained model
         checkpoint = torch.load(args.trained_model, map_location="cpu")
@@ -116,40 +158,12 @@ implementation:
         # Move model to device (same as training brick)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = model.to(device)
-        model.eval()
 
         # Initialize criterion
         criterion = torch.nn.CrossEntropyLoss()
-        all_preds, all_targets = [], []
-        total_loss = 0.0
 
-        # Evaluation loop (same as training brick)
-        with torch.no_grad():
-            for X, y in test_loader:
-                X, y = X.to(device), y.to(device)
-                if X.dtype != torch.float32:
-                    X = X.float()
-
-                logits = model(X)
-                loss = criterion(logits, y)
-                total_loss += loss.item()
-
-                preds = logits.argmax(dim=1)
-                all_preds.extend(preds.cpu().numpy())
-                all_targets.extend(y.cpu().numpy())
-
-        # Compute metrics
-        accuracy = float(accuracy_score(all_targets, all_preds))
-        report = classification_report(all_targets, all_preds, output_dict=True)
-        cm = confusion_matrix(all_targets, all_preds).tolist()
-
-        results = {
-            "accuracy": accuracy,
-            "loss": float(total_loss / len(test_loader)),
-            "classification_report": report,
-            "confusion_matrix": cm,
-            "total_samples": len(all_targets)
-        }
+        # Evaluate the model
+        results = model.eval_model(test_loader, criterion, device)
 
         # Save output metrics
         os.makedirs(os.path.dirname(args.metrics), exist_ok=True)
