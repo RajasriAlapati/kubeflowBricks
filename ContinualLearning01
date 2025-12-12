@@ -1,56 +1,35 @@
-name: ContinualLearning01
-description: |
-  Continual learning using Replay method with a universal previous-model loader.
-  - Loads previous checkpoint (any common format / nested dict / pickled object / directory).
-  - Loads or creates replay buffer, merges with new data.
-  - Trains (fine-tune) the model on merged data.
-  - Saves updated model checkpoint, updated replay buffer, and training metrics.
+name: ContinualLearningCNN
+description: Replay-based continual learning for CNN models.
 
 inputs:
-  - name: data_path
+  - name: processed_data_pickle
     type: Dataset
-    description: "Pickled dataset (should be a pickled object or file containing new training samples)"
 
-  - name: config
-    type: String
-    description: |
-      JSON config string. Example:
-      {
-        "num_epochs": 10,
-        "batch_size": 32,
-        "learning_rate": 0.001,
-        "replay_buffer_size": 500,
-        "prev_replay_path": "prev_replay.pkl",
-        "prev_checkpoint_path": "prev_model.pt",
-        "replay_sampling": "random"   # or "reservoir"
-      }
-
-  - name: prev_model
-    type: String
+  - name: previous_model
+    type: Model
+    description: "Optional previous model checkpoint"
     optional: true
-    description: "Optional path to previous model checkpoint (file or directory)."
 
   - name: previous_replay_buffer
     type: Dataset
+    description: "Optional previous replay buffer pickle"
     optional: true
-    description: "Optional previous replay buffer (pickle)"
+
+  - name: config_str
+    type: String
+    description: "Training + replay configuration JSON string"
 
 outputs:
-  - name: model_path
+  - name: updated_model
     type: Model
-    description: "Updated model checkpoint (state_dict saved)"
-
-  - name: replay_buffer
+  - name: updated_replay_buffer
     type: Dataset
-    description: "Updated replay buffer (pickled)"
-
-  - name: training_metrics
+  - name: training_report
     type: String
-    description: "JSON metrics for training"
 
 implementation:
   container:
-    image: python:3.10
+    image: python:3.9
     command:
       - sh
       - -c
@@ -65,337 +44,184 @@ implementation:
       - -u
       - -c
       - |
-        import argparse
-        import json
-        import os
-        import pickle
-        import random
-        import torch
+        import os, json, torch, pickle, argparse, random
         import torch.nn as nn
         import torch.optim as optim
-        import numpy as np
-        from torch.utils.data import DataLoader, TensorDataset
 
-        # ---------- Custom Dataset Class ----------
-        class CustomJSONDataset(torch.utils.data.Dataset):
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, **kwargs)
-                # Add any specific customization you need for your dataset here
-            def __getitem__(self, idx):
-                item = self.data[idx]
-                img = Image.open(io.BytesIO(base64.b64decode(item['image_data']))).convert('RGB')
-                return self.transform(img) if self.transform else img, item['label']
-        
-        class DataWrapper:
-            def __init__(self, d=None):
-                if d:
-                    self.__dict__.update(d)
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--processed_data_pickle")
+        parser.add_argument("--previous_model", required=False)
+        parser.add_argument("--previous_replay_buffer", required=False)
+        parser.add_argument("--config_str")
+        parser.add_argument("--updated_model")
+        parser.add_argument("--updated_replay_buffer")
+        parser.add_argument("--training_report")
+        args = parser.parse_args()
 
-        # ---------- Universal loader ----------
-        def universal_load_state_dict(prev_path):
-            '''
-            Attempts many heuristics to extract a state_dict or dict-like mapping
-            from prev_path. Returns dict-like state_dict or None.
-            '''
-            import os, torch, pickle
-            if not prev_path:
-                return None, "no-path"
-            if os.path.isdir(prev_path):
-                # try common filenames
-                candidates = ["model.pt","model.pth","model.ckpt","trained_model.pt","checkpoint.pt","state_dict.pth"]
-                for c in candidates:
-                    p = os.path.join(prev_path, c)
-                    if os.path.exists(p):
-                        prev_path = p
-                        break
-            try:
-                ckpt = torch.load(prev_path, map_location="cpu")
-            except Exception as e_load:
-                # Try pickle load fallback
-                try:
-                    with open(prev_path, "rb") as f:
-                        ckpt = pickle.load(f)
-                except Exception as e_pickle:
-                    return None, f"both-torch-and-pickle-failed: {e_load} | {e_pickle}"
+        # -------------------------------------------------------
+        # Load config
+        # -------------------------------------------------------
+        cfg = json.loads(args.config_str)
 
-            # If ckpt is dict
-            if isinstance(ckpt, dict):
-                # common keys
-                for key in ("model_state_dict","state_dict","model"):
-                    if key in ckpt and isinstance(ckpt[key], dict):
-                        return ckpt[key], f"found-key-{key}"
-                # if ckpt itself looks like a state_dict
-                all_tensor_vals = all(hasattr(v,"dtype") or isinstance(v,(torch.Tensor,)) for v in ckpt.values()) if len(ckpt)>0 else False
-                if all_tensor_vals:
-                    return ckpt, "raw-state-dict"
-                # nested: try to find first dict-like value that looks like a state_dict
-                for k,v in ckpt.items():
-                    if isinstance(v, dict):
-                        # check if values look like tensors or arrays
-                        if len(v)>0:
-                            sample = next(iter(v.values()))
-                            if isinstance(sample, (torch.Tensor, np.ndarray)) or hasattr(sample,'dtype'):
-                                return v, f"nested-key-{k}"
-                # not found
-                return None, "dict-but-no-state"
-            # If ckpt is object with state_dict method
-            if hasattr(ckpt, "state_dict"):
-                try:
-                    sd = ckpt.state_dict()
-                    if isinstance(sd, dict):
-                        return sd, "object-state_dict"
-                except Exception as e:
-                    return None, f"object-state-failed:{e}"
-            return None, "unknown-format"
+        replay_size = cfg["training"].get("replay_buffer_size", 500)
+        batch_size = cfg["training"].get("batch_size", 32)
+        lr = cfg["training"]["optimizer"].get("learning_rate", 0.001)
+        epochs = cfg["training"].get("epochs", 3)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # ---------- Simple CNN definition ----------
+        # -------------------------------------------------------
+        # Load new processed data
+        # -------------------------------------------------------
+        with open(args.processed_data_pickle, "rb") as f:
+            processed = pickle.load(f)
+
+        train_loader = processed.train_loader
+        num_classes = processed.num_classes
+
+        # -------------------------------------------------------
+        # Build Model
+        # -------------------------------------------------------
         class SimpleCNN(nn.Module):
-            def __init__(self, input_channels=3, num_classes=10):
+            def __init__(self, num_classes):
                 super().__init__()
-                self.conv = nn.Sequential(
-                    nn.Conv2d(input_channels, 32, kernel_size=3, padding=1),
-                    nn.ReLU(),
-                    nn.MaxPool2d(2),
-                    nn.Conv2d(32, 64, kernel_size=3, padding=1),
-                    nn.ReLU(),
-                    nn.MaxPool2d(2),
+                self.features = nn.Sequential(
+                    nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+                    nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2)
                 )
-                self.fc = nn.Sequential(
+                self.classifier = nn.Sequential(
                     nn.Flatten(),
-                    nn.Linear(64 * 8 * 8, 128),
+                    nn.Linear(64*56*56, 128),
                     nn.ReLU(),
                     nn.Linear(128, num_classes)
                 )
+
             def forward(self, x):
-                return self.fc(self.conv(x))
+                x = self.features(x)
+                return self.classifier(x)
 
-        # ---------- Replay helper ----------
-        def load_replay_buffer(path):
-            if path and os.path.exists(path):
-                try:
-                    with open(path, "rb") as f:
-                        rb = pickle.load(f)
-                    if isinstance(rb, dict) and "x" in rb and "y" in rb:
-                        return rb["x"], rb["y"]
-                    else:
-                        return rb, None
-                except Exception:
-                    return None, None
-            return None, None
+        model = SimpleCNN(num_classes).to(device)
 
-        def save_replay_buffer(path, x_list, y_list):
-            with open(path, "wb") as f:
-                pickle.dump({"x": x_list, "y": y_list}, f)
-
-        # ---------- training ----------
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--data_path", type=str, required=True)
-        parser.add_argument("--config", type=str, required=True)
-        parser.add_argument("--prev_model", type=str, default="")
-        parser.add_argument("--model_path", type=str, required=True)
-        parser.add_argument("--replay_out", type=str, required=True)
-        parser.add_argument("--metrics_out", type=str, required=True)
-        args = parser.parse_args()
-
-        # load config JSON (passed as a string via {inputValue: config})
-        cfg = json.loads(args.config)
-        num_epochs = int(cfg.get("num_epochs", 10))
-        batch_size = int(cfg.get("batch_size", 32))
-        lr = float(cfg.get("learning_rate", 1e-3))
-        replay_buffer_size = int(cfg.get("replay_buffer_size", 500))
-        prev_replay_path = cfg.get("prev_replay_path", "")
-        prev_ckpt_path = cfg.get("prev_checkpoint_path", None) or args.prev_model
-        replay_sampling = cfg.get("replay_sampling", "random")
-
-        # load new data: accept some common formats:
-        #  - pickled dict with keys 'x','y' where x: numpy array or list of arrays, y: labels
-        #  - pickled TensorDataset or list of tuples
-        with open(args.data_path, "rb") as f:
-            data_obj = pickle.load(f)
-
-        # try to coerce to numpy arrays
-        def to_numpy_list(x):
-            if isinstance(x, np.ndarray):
-                return [x]
-            if isinstance(x, list):
-                return x
-            if hasattr(x, "tolist"):
-                return [np.array(x)]
-            return list(x)
-
-        new_x, new_y = None, None
-        # common patterns
-        if isinstance(data_obj, dict) and "x" in data_obj and "y" in data_obj:
-            new_x = np.array(data_obj["x"])
-            new_y = np.array(data_obj["y"])
-        elif isinstance(data_obj, (list, tuple)):
-            # list of (x,y)
-            xs = []
-            ys = []
-            for item in data_obj:
-                if isinstance(item, (list,tuple)) and len(item) >= 2:
-                    xs.append(np.array(item[0]))
-                    ys.append(int(item[1]))
-            new_x = np.array(xs)
-            new_y = np.array(ys)
+        # -------------------------------------------------------
+        # Load previous model (optional)
+        # -------------------------------------------------------
+        if args.previous_model and os.path.exists(args.previous_model):
+            print("Loading previous model checkpoint")
+            model.load_state_dict(torch.load(args.previous_model, map_location=device))
         else:
-            # last resort: try numpy
-            try:
-                arr = np.array(data_obj)
-                new_x = arr
-                new_y = np.zeros(len(arr), dtype=int)
-            except Exception:
-                raise RuntimeError("Unsupported input dataset format")
+            print("No previous model provided — training from scratch")
 
-        # Ensure shapes: new_x shape = (N, C, H, W)
-        # If input is (N, H, W, C) convert
-        if new_x.ndim == 4 and new_x.shape[-1] in (1,3):
-            # NHWC -> NCHW
-            if new_x.shape[-1] in (1,3):
-                new_x = np.transpose(new_x, (0,3,1,2))
+        # -------------------------------------------------------
+        # Load previous replay buffer (optional)
+        # -------------------------------------------------------
+        replay_buffer = []
 
-        # cast to float32
-        new_x = new_x.astype(np.float32)
-        new_y = new_y.astype(np.int64)
-
-        # Load replay buffer if exists
-        replay_x, replay_y = None, None
-        if prev_replay_path and os.path.exists(prev_replay_path):
-            try:
-                with open(prev_replay_path, "rb") as f:
-                    rb = pickle.load(f)
-                replay_x = np.array(rb.get("x", []))
-                replay_y = np.array(rb.get("y", []))
-            except Exception:
-                replay_x, replay_y = None, None
-
-        # Create model and try to load previous checkpoint with heuristics
-        num_classes = int(cfg.get("num_classes", 10))
-        input_channels = int(cfg.get("input_channels", 3))
-
-        model = SimpleCNN(input_channels, num_classes)
-
-        # Try universal loader: check prev_ckpt_path, then args.prev_model
-        sd, reason = None, None
-        if prev_ckpt_path:
-            sd, reason = universal_load_state_dict(prev_ckpt_path)
-            # If failed, attempt args.prev_model path
-        if sd is None and args.prev_model:
-            sd, reason = universal_load_state_dict(args.prev_model)
-
-        loaded_any = False
-        if sd is not None:
-            try:
-                model.load_state_dict(sd, strict=False)
-                print(f"=> Loaded state_dict ({reason}), merged with model (strict=False).")
-                loaded_any = True
-            except Exception as e:
-                print("=> state_dict load failed:", e)
-
-        if not loaded_any:
-            print("=> No usable checkpoint/state_dict found or applied. Continuing from init weights.")
-
-        # Merge replay: simple concatenation with optional reservoir sampling
-        if replay_x is None:
-            replay_x = np.array([], dtype=new_x.dtype).reshape(0,*new_x.shape[1:])
-            replay_y = np.array([], dtype=new_y.dtype)
-        # Create combined pool
-        combined_x = np.concatenate([new_x, replay_x], axis=0) if len(replay_x)>0 else new_x
-        combined_y = np.concatenate([new_y, replay_y], axis=0) if len(replay_y)>0 else new_y
-
-        # If combined size > replay_buffer_size, keep most recent new_x plus sampled old
-        if len(combined_x) > replay_buffer_size:
-            # keep all new samples first then sample older to fill buffer
-            n_new = len(new_x)
-            keep_new = min(n_new, replay_buffer_size)
-            remaining = replay_buffer_size - keep_new
-            # sample from old (replay_x)
-            if len(replay_x) > 0 and remaining > 0:
-                idxs = list(range(len(replay_x)))
-                if replay_sampling == "random":
-                    sampled = random.sample(idxs, k=min(len(idxs), remaining))
-                else:
-                    sampled = idxs[:remaining]
-                sel_x = replay_x[sampled]
-                sel_y = replay_y[sampled]
-                buf_x = np.concatenate([new_x[:keep_new], sel_x], axis=0)
-                buf_y = np.concatenate([new_y[:keep_new], sel_y], axis=0)
-            else:
-                buf_x = new_x[:replay_buffer_size]
-                buf_y = new_y[:replay_buffer_size]
+        if args.previous_replay_buffer and os.path.exists(args.previous_replay_buffer):
+            print("Loading previous replay buffer")
+            with open(args.previous_replay_buffer, "rb") as f:
+                replay_buffer = pickle.load(f)
         else:
-            buf_x = combined_x
-            buf_y = combined_y
+            print("No previous replay buffer provided")
 
-        # Create DataLoader
-        tensor_x = torch.tensor(buf_x, dtype=torch.float32)
-        tensor_y = torch.tensor(buf_y, dtype=torch.long)
-        loader = DataLoader(TensorDataset(tensor_x, tensor_y), batch_size=int(cfg.get("batch_size",32)), shuffle=True)
-
-        # Training
-        device = torch.device("cuda" if torch.cuda.is_available() and cfg.get("use_cuda", False) else "cpu")
-        model = model.to(device)
         optimizer = optim.Adam(model.parameters(), lr=lr)
-        criterion = nn.CrossEntropyLoss()
+        loss_fn = nn.CrossEntropyLoss()
 
-        metrics = {"loss": [], "accuracy": [], "loaded_checkpoint": bool(loaded_any)}
+        # -------------------------------------------------------
+        # Convert replay buffer → DataLoader
+        # -------------------------------------------------------
+        def build_replay_loader(buffer):
+            if len(buffer) == 0:
+                return None
 
-        for epoch in range(num_epochs):
+            tensor_x = torch.stack([item[0] for item in buffer])
+            tensor_y = torch.tensor([item[1] for item in buffer])
+
+            ds = torch.utils.data.TensorDataset(tensor_x, tensor_y)
+            return torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
+
+        replay_loader = build_replay_loader(replay_buffer)
+
+        # -------------------------------------------------------
+        # Training loop with replay
+        # -------------------------------------------------------
+        def sample_batch(loader):
+            for batch in loader:
+                yield batch
+
+        report = {"epochs": epochs, "loss_per_epoch": []}
+
+        for ep in range(epochs):
             model.train()
-            total_loss = 0.0
-            correct = 0
-            total = 0
-            for xb, yb in loader:
-                xb = xb.to(device)
-                yb = yb.to(device)
-                optimizer.zero_grad()
-                out = model(xb)
-                loss = criterion(out, yb)
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-                preds = out.argmax(dim=1)
-                correct += (preds == yb).sum().item()
-                total += yb.size(0)
-            metrics["loss"].append(total_loss / len(loader))
-            metrics["accuracy"].append(correct / total if total>0 else 0.0)
-            print(f"[Epoch {epoch+1}/{num_epochs}] loss={metrics['loss'][-1]:.4f} acc={metrics['accuracy'][-1]:.4f}")
+            total_loss = 0
 
-        # Save updated model state_dict
-        os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
-        torch.save(model.state_dict(), args.model_path)
+            # Mix replay + new data
+            loaders = []
+            if replay_loader:
+                loaders.append(sample_batch(replay_loader))
+            loaders.append(sample_batch(train_loader))
 
-        # Save updated replay buffer (buf_x, buf_y)
-        os.makedirs(os.path.dirname(args.replay_out), exist_ok=True)
-        with open(args.replay_out, "wb") as f:
-            pickle.dump({"x": buf_x, "y": buf_y}, f)
+            for loader in loaders:
+                for x, y in loader:
+                    x, y = x.to(device), y.to(device)
 
-        # Save metrics
-        with open(args.metrics_out, "w") as f:
-            json.dump(metrics, f)
+                    optimizer.zero_grad()
+                    out = model(x)
+                    loss = loss_fn(out, y)
+                    loss.backward()
+                    optimizer.step()
 
-        print("Saved model:", args.model_path)
-        print("Saved replay buffer:", args.replay_out)
-        print("Saved metrics:", args.metrics_out)
+                    total_loss += loss.item()
 
+            avg_loss = total_loss
+            report["loss_per_epoch"].append(avg_loss)
+            print(f"Epoch {ep+1}/{epochs} - Loss={avg_loss}")
+
+        # -------------------------------------------------------
+        # Update replay buffer
+        # -------------------------------------------------------
+        # Extract random samples from new data
+        new_buffer_items = []
+
+        for x, y in train_loader:
+            for i in range(len(x)):
+                new_buffer_items.append((x[i].cpu(), int(y[i])))
+
+        # Merge old + new
+        combined = replay_buffer + new_buffer_items
+
+        # Keep replay size fixed
+        random.shuffle(combined)
+        combined = combined[:replay_size]
+
+        # -------------------------------------------------------
+        # Save updated replay buffer
+        # -------------------------------------------------------
+        with open(args.updated_replay_buffer, "wb") as f:
+            pickle.dump(combined, f)
+
+        # -------------------------------------------------------
+        # Save updated model
+        # -------------------------------------------------------
+        torch.save(model.state_dict(), args.updated_model)
+
+        # -------------------------------------------------------
+        # Save training report
+        # -------------------------------------------------------
+        with open(args.training_report, "w") as f:
+            json.dump(report, f, indent=2)
+
+        print("Continual Learning update complete!")
     args:
       - --processed_data_pickle
       - {inputPath: processed_data_pickle}
-
       - --previous_model
       - {inputPath: previous_model}
-
       - --previous_replay_buffer
       - {inputPath: previous_replay_buffer}
-
       - --config_str
       - {inputValue: config_str}
-
       - --updated_model
       - {outputPath: updated_model}
-
       - --updated_replay_buffer
       - {outputPath: updated_replay_buffer}
-
       - --training_report
       - {outputPath: training_report}
