@@ -34,7 +34,6 @@ implementation:
       - sh
       - -c
       - |
-        set -e
         python3 -m pip install --quiet --upgrade pip setuptools wheel
         python3 -m pip install --quiet "numpy<2,>=1.22" "pillow" "torch" "torchvision==0.17.0"
         exec "$0" "$@"
@@ -42,7 +41,6 @@ implementation:
       - -u
       - -c
       - |
-        # -*- coding: utf-8 -*-
         import os, json, torch, pickle, argparse, random, traceback, sys
         import torch.nn as nn
         import torch.optim as optim
