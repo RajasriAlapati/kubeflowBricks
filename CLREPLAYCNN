@@ -133,7 +133,7 @@ implementation:
                 )
                 self.classifier = nn.Sequential(
                     nn.Flatten(),
-                    nn.Linear(64*56*56, 128),
+                    nn.Linear(feature_size, 128),
                     nn.ReLU(),
                     nn.Linear(128, num_classes)
                 )
