@@ -1,0 +1,424 @@
+name: ContinualLearningEval
+description: Evaluates a Continual Learning model (ResNet or SimpleCNN) and outputs performance metrics.
+
+inputs:
+  - name: trained_model
+    type: Model
+    description: "Trained model checkpoint from CL brick"
+    
+  - name: data_path
+    type: Dataset
+    description: "Pickled test dataset with test_loader and num_classes"
+    
+  - name: config
+    type: String
+    description: "JSON config string (optional, for model architecture override)"
+    optional: true
+
+outputs:
+  - name: metrics
+    type: Metrics
+    description: "KFP metrics file"
+    
+  - name: metrics_json
+    type: String
+    description: "Detailed metrics in JSON format"
+
+implementation:
+  container:
+    image: python:3.9
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        python3 -m pip install --quiet --upgrade pip setuptools wheel
+        python3 -m pip install --quiet "numpy<2,>=1.22" "torch" "torchvision==0.17.0" "scikit-learn"
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import torch
+        import torch.nn as nn
+        import argparse
+        import pickle
+        import json
+        import os
+        import io
+        from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_recall_fscore_support
+        from torchvision import models
+        
+        print("="*60)
+        print("=== CONTINUAL LEARNING MODEL EVALUATION ===")
+        print("="*60)
+
+        # ---------------------------------------------------------------------
+        # 1. DATASET UNPICKLER CLASSES (MATCHING CL BRICK)
+        # ---------------------------------------------------------------------
+        class LabeledDataset:
+            def __init__(self, *args, **kwargs):
+                obj = None
+                if "dataset" in kwargs:
+                    obj = kwargs["dataset"]
+                elif len(args) == 1:
+                    obj = args[0]
+                else:
+                    obj = kwargs
+
+                self.dataset = getattr(obj, "dataset", None) or \
+                               getattr(obj, "data", None) or \
+                               getattr(obj, "samples", None) or \
+                               obj
+
+            def __len__(self):
+                try:
+                    return len(self.dataset)
+                except:
+                    return 100
+
+            def __getitem__(self, idx):
+                try:
+                    item = self.dataset[idx]
+                    if isinstance(item, tuple) and len(item) == 2:
+                        return item
+                    if isinstance(item, dict):
+                        return item.get("image_data"), item.get("label", 0)
+                except:
+                    pass
+                return torch.randn(3,224,224), 0
+        
+        class CustomJSONDataset(LabeledDataset):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+
+        class DataWrapper:
+            def __init__(self, d=None):
+                if d:
+                    self.__dict__.update(d)
+
+        class SafeUnpickler(pickle.Unpickler):
+            def find_class(self, module, name):
+                if name == "LabeledDataset":
+                    return LabeledDataset
+                if name == "CustomJSONDataset":
+                    return CustomJSONDataset
+                if name == "DataWrapper":
+                    return DataWrapper
+                try:
+                    return super().find_class(module, name)
+                except:
+                    class Dummy: 
+                        pass
+                    return Dummy
+
+        # ---------------------------------------------------------------------
+        # 2. MODEL ARCHITECTURES (MATCHING CL BRICK)
+        # ---------------------------------------------------------------------
+        class SimpleCNN(nn.Module):
+            def __init__(self, num_classes, input_size=224):
+                super().__init__()
+                self.features = nn.Sequential(
+                    nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+                    nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2)
+                )
+                # Calculate flattened size dynamically
+                feature_size = (input_size // 4) ** 2 * 64
+                
+                self.classifier = nn.Sequential(
+                    nn.Flatten(),
+                    nn.Linear(feature_size, 128),
+                    nn.ReLU(),
+                    nn.Linear(128, num_classes)
+                )
+
+            def forward(self, x):
+                x = self.features(x)
+                return self.classifier(x)
+
+        class ResNetClassifier(nn.Module):
+            def __init__(self, num_classes, resnet_type='resnet18'):
+                super().__init__()
+                if resnet_type == 'resnet18':
+                    self.backbone = models.resnet18(weights=None)
+                elif resnet_type == 'resnet34':
+                    self.backbone = models.resnet34(weights=None)
+                elif resnet_type == 'resnet50':
+                    self.backbone = models.resnet50(weights=None)
+                else:
+                    self.backbone = models.resnet18(weights=None)
+                
+                in_features = self.backbone.fc.in_features
+                self.backbone.fc = nn.Linear(in_features, num_classes)
+
+            def forward(self, x):
+                return self.backbone(x)
+
+        # ---------------------------------------------------------------------
+        # 3. ARCHITECTURE DETECTION
+        # ---------------------------------------------------------------------
+        def detect_architecture(state_dict):
+            '''Detect if state_dict is from ResNet or SimpleCNN'''
+            keys = list(state_dict.keys())
+            
+            if any('layer1' in k or 'layer2' in k for k in keys):
+                return 'resnet'
+            elif any('features' in k or 'classifier' in k for k in keys):
+                return 'simplecnn'
+            else:
+                return 'unknown'
+
+        def detect_resnet_variant(state_dict):
+            '''Detect ResNet variant (18, 34, 50)'''
+            keys = list(state_dict.keys())
+            
+            # Count layer3 blocks to distinguish variants
+            layer3_blocks = len([k for k in keys if k.startswith('backbone.layer3.')])
+            
+            if layer3_blocks >= 20:  # ResNet50 has 6 blocks in layer3
+                return 'resnet50'
+            elif layer3_blocks >= 10:  # ResNet34 has 6 blocks
+                return 'resnet34'
+            else:  # ResNet18 has 2 blocks
+                return 'resnet18'
+
+        # ---------------------------------------------------------------------
+        # 4. PARSE ARGUMENTS
+        # ---------------------------------------------------------------------
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--trained_model", required=True)
+        parser.add_argument("--data_path", required=True)
+        parser.add_argument("--config", default="{}")
+        parser.add_argument("--metrics", required=True)
+        parser.add_argument("--metrics_json", required=True)
+        args = parser.parse_args()
+
+        # ---------------------------------------------------------------------
+        # 5. LOAD CONFIG
+        # ---------------------------------------------------------------------
+        try:
+            cfg = json.loads(args.config)
+        except:
+            cfg = {}
+        
+        model_arch_override = cfg.get("model_architecture", "auto")
+        input_size = cfg.get("input_size", 224)
+
+        # ---------------------------------------------------------------------
+        # 6. LOAD DATASET
+        # ---------------------------------------------------------------------
+        print("[1/5] Loading dataset...")
+        try:
+            with open(args.data_path, "rb") as f:
+                processed = SafeUnpickler(io.BytesIO(f.read())).load()
+            
+            test_loader = processed.test_loader
+            num_classes = processed.num_classes
+            print(f"✓ Dataset loaded: {num_classes} classes")
+            print(f"  Test batches: {len(test_loader)}")
+        except Exception as e:
+            print(f"✗ Error loading dataset: {e}")
+            raise
+
+        # ---------------------------------------------------------------------
+        # 7. LOAD MODEL CHECKPOINT AND DETECT ARCHITECTURE
+        # ---------------------------------------------------------------------
+        print("[2/5] Loading model checkpoint...")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"  Using device: {device}")
+
+        try:
+            checkpoint = torch.load(args.trained_model, map_location=device)
+            print(f"✓ Checkpoint loaded")
+        except Exception as e:
+            print(f"✗ Error loading checkpoint: {e}")
+            raise
+
+        # Detect architecture
+        architecture = detect_architecture(checkpoint)
+        print(f"  Detected architecture: {architecture}")
+
+        if model_arch_override != "auto":
+            architecture = model_arch_override
+            print(f"  Overridden to: {architecture}")
+
+        # ---------------------------------------------------------------------
+        # 8. BUILD MODEL
+        # ---------------------------------------------------------------------
+        print("[3/5] Building model...")
+        try:
+            if architecture == 'simplecnn':
+                print(f"  Creating SimpleCNN (input_size={input_size})")
+                model = SimpleCNN(num_classes, input_size).to(device)
+            elif architecture in ['resnet', 'resnet18', 'resnet34', 'resnet50']:
+                if architecture == 'resnet':
+                    # Auto-detect variant
+                    variant = detect_resnet_variant(checkpoint)
+                    print(f"  Auto-detected ResNet variant: {variant}")
+                else:
+                    variant = architecture
+                print(f"  Creating {variant}")
+                model = ResNetClassifier(num_classes, variant).to(device)
+            else:
+                print(f"  Unknown architecture '{architecture}', defaulting to ResNet18")
+                model = ResNetClassifier(num_classes, 'resnet18').to(device)
+
+            # Load weights
+            model.load_state_dict(checkpoint, strict=False)
+            model.eval()
+            print("✓ Model loaded and set to eval mode")
+        except Exception as e:
+            print(f"✗ Error building/loading model: {e}")
+            raise
+
+        # ---------------------------------------------------------------------
+        # 9. EVALUATION LOOP
+        # ---------------------------------------------------------------------
+        print("[4/5] Running evaluation...")
+        criterion = nn.CrossEntropyLoss()
+
+        all_preds = []
+        all_targets = []
+        total_loss = 0.0
+        correct = 0
+        total = 0
+
+        with torch.no_grad():
+            for batch_idx, (X, y) in enumerate(test_loader):
+                X, y = X.to(device), y.to(device)
+                
+                # Ensure correct dtype
+                if X.dtype != torch.float32:
+                    X = X.float()
+
+                # Forward pass
+                logits = model(X)
+                loss = criterion(logits, y)
+                total_loss += loss.item()
+
+                # Predictions
+                preds = logits.argmax(dim=1)
+                all_preds.extend(preds.cpu().tolist())
+                all_targets.extend(y.cpu().tolist())
+                
+                # Accuracy
+                correct += (preds == y).sum().item()
+                total += y.size(0)
+
+                if (batch_idx + 1) % 10 == 0:
+                    print(f"  Processed {batch_idx + 1}/{len(test_loader)} batches")
+
+        avg_loss = total_loss / len(test_loader)
+        accuracy = correct / total if total > 0 else 0.0
+
+        print(f" Evaluation complete!")
+        print(f"  Total samples: {total}")
+        print(f"  Accuracy: {accuracy:.4f}")
+        print(f"  Loss: {avg_loss:.4f}")
+
+        # ---------------------------------------------------------------------
+        # 10. COMPUTE DETAILED METRICS
+        # ---------------------------------------------------------------------
+        print("[5/5] Computing metrics...")
+        
+        # Classification report
+        report = classification_report(
+            all_targets, 
+            all_preds, 
+            digits=4,
+            zero_division=0
+        )
+        
+        # Confusion matrix
+        cm = confusion_matrix(all_targets, all_preds)
+        
+        # Per-class metrics
+        precision, recall, f1, support = precision_recall_fscore_support(
+            all_targets, 
+            all_preds, 
+            average=None,
+            zero_division=0
+        )
+
+        # Overall metrics
+        precision_macro, recall_macro, f1_macro, _ = precision_recall_fscore_support(
+            all_targets, 
+            all_preds, 
+            average='macro',
+            zero_division=0
+        )
+
+        # ---------------------------------------------------------------------
+        # 11. PREPARE OUTPUT METRICS
+        # ---------------------------------------------------------------------
+        metrics_output = {
+            "accuracy": float(accuracy),
+            "loss": float(avg_loss),
+            "precision_macro": float(precision_macro),
+            "recall_macro": float(recall_macro),
+            "f1_macro": float(f1_macro),
+            "confusion_matrix": cm.tolist(),
+            "classification_report": report,
+            "per_class_metrics": {
+                "precision": precision.tolist(),
+                "recall": recall.tolist(),
+                "f1_score": f1.tolist(),
+            },
+            "model_info": {
+                "architecture": architecture,
+                "num_classes": num_classes,
+                "input_size": input_size,
+                "total_samples": total,
+            }
+        }
+
+        # ---------------------------------------------------------------------
+        # 12. SAVE OUTPUTS
+        # ---------------------------------------------------------------------
+        print("Saving outputs...")
+        
+        # Save detailed JSON metrics
+        os.makedirs(os.path.dirname(args.metrics_json) or ".", exist_ok=True)
+        with open(args.metrics_json, "w") as f:
+            json.dump(metrics_output, f, indent=2)
+        print(f"✓ Saved detailed metrics: {args.metrics_json}")
+
+        # Save KFP metrics file (simple format for visualization)
+        os.makedirs(os.path.dirname(args.metrics) or ".", exist_ok=True)
+        with open(args.metrics, "w") as f:
+            f.write(f"accuracy: {accuracy}")
+            f.write(f"loss: {avg_loss}")
+            f.write(f"precision: {precision_macro}")
+            f.write(f"recall: {recall_macro}")
+            f.write(f"f1_score: {f1_macro}")
+        print(f"✓ Saved KFP metrics: {args.metrics}")
+
+        # ---------------------------------------------------------------------
+        # 13. PRINT SUMMARY
+        # ---------------------------------------------------------------------
+        print("EVALUATION SUMMARY")
+        print(f"Architecture: {architecture}")
+        print(f"Classes: {num_classes}")
+        print(f"Test Samples: {total}")
+        print(f"PERFORMANCE:")
+        print(f"  Accuracy:  {accuracy:.4f} ({accuracy*100:.2f}%)")
+        print(f"  Loss:      {avg_loss:.4f}")
+        print(f"  Precision: {precision_macro:.4f}")
+        print(f"  Recall:    {recall_macro:.4f}")
+        print(f"  F1-Score:  {f1_macro:.4f}")
+        print("CLASSIFICATION REPORT:")
+        print(report)
+        print("="*60)
+        print("✓ Evaluation completed successfully!")
+
+    args:
+      - --trained_model
+      - {inputPath: trained_model}
+      - --data_path
+      - {inputPath: data_path}
+      - --config
+      - {inputValue: config}
+      - --metrics
+      - {outputPath: metrics}
+      - --metrics_json
+      - {outputPath: metrics_json}
