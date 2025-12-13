@@ -83,8 +83,12 @@ implementation:
                 try:
                     return super().find_class(module, name)
                 except:
-                    class Dummy: 
-                        pass
+                    class Dummy:
+                      def __init__(self, *a, **kw):
+                          pass
+                      def __call__(self, *a, **kw):
+                          return None
+
                     return Dummy
 
         # ---------------------------------------------------------------------
