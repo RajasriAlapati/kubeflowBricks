@@ -53,9 +53,7 @@ implementation:
         print("=== CONTINUAL LEARNING MODEL EVALUATION ===")
         print("="*60)
 
-        # ---------------------------------------------------------------------
         # 1. DATASET UNPICKLER CLASSES (MATCHING CL BRICK)
-        # ---------------------------------------------------------------------
         class LabeledDataset:
             def __init__(self, *args, **kwargs):
                 obj = None
@@ -66,9 +64,9 @@ implementation:
                 else:
                     obj = kwargs
 
-                self.dataset = getattr(obj, "dataset", None) or \
-                               getattr(obj, "data", None) or \
-                               getattr(obj, "samples", None) or \
+                self.dataset = getattr(obj, "dataset", None) or 
+                               getattr(obj, "data", None) or 
+                               getattr(obj, "samples", None) or 
                                obj
 
             def __len__(self):
@@ -112,9 +110,7 @@ implementation:
                         pass
                     return Dummy
 
-        # ---------------------------------------------------------------------
         # 2. MODEL ARCHITECTURES (MATCHING CL BRICK)
-        # ---------------------------------------------------------------------
         class SimpleCNN(nn.Module):
             def __init__(self, num_classes, input_size=224):
                 super().__init__()
@@ -154,9 +150,7 @@ implementation:
             def forward(self, x):
                 return self.backbone(x)
 
-        # ---------------------------------------------------------------------
         # 3. ARCHITECTURE DETECTION
-        # ---------------------------------------------------------------------
         def detect_architecture(state_dict):
             '''Detect if state_dict is from ResNet or SimpleCNN'''
             keys = list(state_dict.keys())
@@ -169,22 +163,45 @@ implementation:
                 return 'unknown'
 
         def detect_resnet_variant(state_dict):
-            '''Detect ResNet variant (18, 34, 50)'''
+            '''Detect ResNet variant (18, 34, 50) based on FC layer size or bottleneck structure'''
             keys = list(state_dict.keys())
             
-            # Count layer3 blocks to distinguish variants
-            layer3_blocks = len([k for k in keys if k.startswith('backbone.layer3.')])
+            # Method 1: Check FC layer input size (most reliable)
+            fc_key = None
+            for k in ['backbone.fc.weight', 'fc.weight']:
+                if k in state_dict:
+                    fc_key = k
+                    break
             
-            if layer3_blocks >= 20:  # ResNet50 has 6 blocks in layer3
+            if fc_key:
+                fc_shape = state_dict[fc_key].shape
+                in_features = fc_shape[1]  # [out_features, in_features]
+                
+                if in_features == 2048:
+                    return 'resnet50'
+                elif in_features == 512:
+                    # Distinguish ResNet18 vs ResNet34 by counting layer3 blocks
+                    layer3_blocks = len(set([k.split('.')[2] for k in keys if 'backbone.layer3.' in k or 'layer3.' in k]))
+                    if layer3_blocks >= 6:
+                        return 'resnet34'
+                    else:
+                        return 'resnet18'
+            
+            # Method 2: Check for bottleneck structure (3 convs per block = ResNet50)
+            # ResNet50 has conv1, conv2, conv3 in each block
+            # ResNet18/34 only have conv1, conv2
+            has_conv3 = any('conv3.weight' in k for k in keys)
+            if has_conv3:
                 return 'resnet50'
-            elif layer3_blocks >= 10:  # ResNet34 has 6 blocks
+            
+            # Method 3: Count layer blocks as fallback
+            layer3_blocks = len(set([k.split('.')[2] for k in keys if 'layer3.' in k]))
+            if layer3_blocks >= 6:
                 return 'resnet34'
-            else:  # ResNet18 has 2 blocks
+            else:
                 return 'resnet18'
 
-        # ---------------------------------------------------------------------
         # 4. PARSE ARGUMENTS
-        # ---------------------------------------------------------------------
         parser = argparse.ArgumentParser()
         parser.add_argument("--trained_model", required=True)
         parser.add_argument("--data_path", required=True)
@@ -193,9 +210,7 @@ implementation:
         parser.add_argument("--metrics_json", required=True)
         args = parser.parse_args()
 
-        # ---------------------------------------------------------------------
         # 5. LOAD CONFIG
-        # ---------------------------------------------------------------------
         try:
             cfg = json.loads(args.config)
         except:
@@ -204,9 +219,7 @@ implementation:
         model_arch_override = cfg.get("model_architecture", "auto")
         input_size = cfg.get("input_size", 224)
 
-        # ---------------------------------------------------------------------
         # 6. LOAD DATASET
-        # ---------------------------------------------------------------------
         print("[1/5] Loading dataset...")
         try:
             with open(args.data_path, "rb") as f:
@@ -220,9 +233,7 @@ implementation:
             print(f"✗ Error loading dataset: {e}")
             raise
 
-        # ---------------------------------------------------------------------
         # 7. LOAD MODEL CHECKPOINT AND DETECT ARCHITECTURE
-        # ---------------------------------------------------------------------
         print("[2/5] Loading model checkpoint...")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"  Using device: {device}")
@@ -237,15 +248,19 @@ implementation:
         # Detect architecture
         architecture = detect_architecture(checkpoint)
         print(f"  Detected architecture: {architecture}")
+        
+        # Debug: Print FC layer shape if available
+        for fc_key in ['backbone.fc.weight', 'fc.weight']:
+            if fc_key in checkpoint:
+                print(f"  FC layer shape: {checkpoint[fc_key].shape} (key: {fc_key})")
+                break
 
         if model_arch_override != "auto":
             architecture = model_arch_override
             print(f"  Overridden to: {architecture}")
 
-        # ---------------------------------------------------------------------
         # 8. BUILD MODEL
-        # ---------------------------------------------------------------------
-        print("[3/5] Building model...")
+        print("n[3/5] Building model...")
         try:
             if architecture == 'simplecnn':
                 print(f"  Creating SimpleCNN (input_size={input_size})")
@@ -271,9 +286,7 @@ implementation:
             print(f"✗ Error building/loading model: {e}")
             raise
 
-        # ---------------------------------------------------------------------
         # 9. EVALUATION LOOP
-        # ---------------------------------------------------------------------
         print("[4/5] Running evaluation...")
         criterion = nn.CrossEntropyLoss()
 
@@ -300,7 +313,6 @@ implementation:
                 preds = logits.argmax(dim=1)
                 all_preds.extend(preds.cpu().tolist())
                 all_targets.extend(y.cpu().tolist())
-                
                 # Accuracy
                 correct += (preds == y).sum().item()
                 total += y.size(0)
@@ -316,11 +328,9 @@ implementation:
         print(f"  Accuracy: {accuracy:.4f}")
         print(f"  Loss: {avg_loss:.4f}")
 
-        # ---------------------------------------------------------------------
         # 10. COMPUTE DETAILED METRICS
-        # ---------------------------------------------------------------------
         print("[5/5] Computing metrics...")
-        
+
         # Classification report
         report = classification_report(
             all_targets, 
@@ -328,10 +338,10 @@ implementation:
             digits=4,
             zero_division=0
         )
-        
+
         # Confusion matrix
         cm = confusion_matrix(all_targets, all_preds)
-        
+
         # Per-class metrics
         precision, recall, f1, support = precision_recall_fscore_support(
             all_targets, 
@@ -348,9 +358,7 @@ implementation:
             zero_division=0
         )
 
-        # ---------------------------------------------------------------------
         # 11. PREPARE OUTPUT METRICS
-        # ---------------------------------------------------------------------
         metrics_output = {
             "accuracy": float(accuracy),
             "loss": float(avg_loss),
@@ -363,28 +371,27 @@ implementation:
                 "precision": precision.tolist(),
                 "recall": recall.tolist(),
                 "f1_score": f1.tolist(),
+                "support": support.tolist()
             },
             "model_info": {
                 "architecture": architecture,
                 "num_classes": num_classes,
                 "input_size": input_size,
                 "total_samples": total,
+                "device": str(device)
             }
         }
 
-        # ---------------------------------------------------------------------
         # 12. SAVE OUTPUTS
-        # ---------------------------------------------------------------------
-        print("Saving outputs...")
-        
+
         # Save detailed JSON metrics
-        os.makedirs(os.path.dirname(args.metrics_json) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(args.metrics_json), exist_ok=True)
         with open(args.metrics_json, "w") as f:
             json.dump(metrics_output, f, indent=2)
         print(f"✓ Saved detailed metrics: {args.metrics_json}")
 
         # Save KFP metrics file (simple format for visualization)
-        os.makedirs(os.path.dirname(args.metrics) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(args.metrics), exist_ok=True)
         with open(args.metrics, "w") as f:
             f.write(f"accuracy: {accuracy}")
             f.write(f"loss: {avg_loss}")
@@ -393,10 +400,9 @@ implementation:
             f.write(f"f1_score: {f1_macro}")
         print(f"✓ Saved KFP metrics: {args.metrics}")
 
-        # ---------------------------------------------------------------------
         # 13. PRINT SUMMARY
-        # ---------------------------------------------------------------------
         print("EVALUATION SUMMARY")
+        print("="*60)
         print(f"Architecture: {architecture}")
         print(f"Classes: {num_classes}")
         print(f"Test Samples: {total}")
@@ -406,7 +412,6 @@ implementation:
         print(f"  Precision: {precision_macro:.4f}")
         print(f"  Recall:    {recall_macro:.4f}")
         print(f"  F1-Score:  {f1_macro:.4f}")
-        print("CLASSIFICATION REPORT:")
         print(report)
         print("="*60)
         print("✓ Evaluation completed successfully!")
