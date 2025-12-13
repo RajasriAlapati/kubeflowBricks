@@ -64,9 +64,9 @@ implementation:
                 else:
                     obj = kwargs
 
-                self.dataset = getattr(obj, "dataset", None) or 
-                               getattr(obj, "data", None) or 
-                               getattr(obj, "samples", None) or 
+                self.dataset = getattr(obj, "dataset", None) or \
+                               getattr(obj, "data", None) or \
+                               getattr(obj, "samples", None) or \ 
                                obj
 
             def __len__(self):
