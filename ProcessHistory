@@ -1,5 +1,5 @@
 name: ProcessHistory
-description: Flattens training history into epoch-loss rows with correct numeric types (no hardcoding).
+description: Flattens Forward-Forward training history into epoch-loss rows and limits output to top N entries.
 
 inputs:
   - name: training_history_json
@@ -23,23 +23,24 @@ implementation:
         import argparse
         import os
 
-        def flatten_forward_forward(history: dict):
+        def flatten_forward_forward(history, max_rows=5):
             rows = []
             epoch = 0
 
             ff_results = history.get("ff_results", {})
-            blocks = ff_results.get("block_results", [])
+            block_results = ff_results.get("block_results", [])
 
-            for block in blocks:
+            for block in block_results:
                 losses = block.get("epoch_losses", [])
                 for loss in losses:
                     rows.append({
-                        "epoch": epoch,          # int
-                        "loss": float(loss)      # float
+                        "epoch": epoch,
+                        "loss": float(loss)
                     })
                     epoch += 1
 
-            return rows
+            # Take top N rows only (first N epochs)
+            return rows[:max_rows]
 
         parser = argparse.ArgumentParser()
         parser.add_argument("--training_history_json", required=True)
@@ -49,11 +50,10 @@ implementation:
 
         history = json.loads(args.training_history_json)
 
-        # Auto-detect training mode (no hardcoding)
-        if "ff_results" in history:
-            processed_rows = flatten_forward_forward(history)
-        else:
+        if "ff_results" not in history:
             raise ValueError("Unsupported training history format")
+
+        processed_rows = flatten_forward_forward(history, max_rows=5)
 
         output = {
             "data": processed_rows
