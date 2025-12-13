@@ -1,0 +1,75 @@
+name: ProcessHistory
+description: Flattens training history into epoch-loss rows with correct numeric types (no hardcoding).
+
+inputs:
+  - name: training_history_json
+    type: String
+  - name: mapping_json
+    type: String
+
+outputs:
+  - name: processed_history_json
+    type: String
+
+implementation:
+  container:
+    image: python:3.9-slim
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import json
+        import argparse
+        import os
+
+        def flatten_forward_forward(history: dict):
+            rows = []
+            epoch = 0
+
+            ff_results = history.get("ff_results", {})
+            blocks = ff_results.get("block_results", [])
+
+            for block in blocks:
+                losses = block.get("epoch_losses", [])
+                for loss in losses:
+                    rows.append({
+                        "epoch": epoch,          # int
+                        "loss": float(loss)      # float
+                    })
+                    epoch += 1
+
+            return rows
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--training_history_json", required=True)
+        parser.add_argument("--mapping_json", required=True)
+        parser.add_argument("--processed_history_json", required=True)
+        args = parser.parse_args()
+
+        history = json.loads(args.training_history_json)
+
+        # Auto-detect training mode (no hardcoding)
+        if "ff_results" in history:
+            processed_rows = flatten_forward_forward(history)
+        else:
+            raise ValueError("Unsupported training history format")
+
+        output = {
+            "data": processed_rows
+        }
+
+        os.makedirs(os.path.dirname(args.processed_history_json), exist_ok=True)
+        with open(args.processed_history_json, "w") as f:
+            json.dump(output, f, indent=2)
+
+        print("Processed training history:")
+        print(json.dumps(output, indent=2))
+
+    args:
+      - --training_history_json
+      - {inputValue: training_history_json}
+      - --mapping_json
+      - {inputValue: mapping_json}
+      - --processed_history_json
+      - {outputPath: processed_history_json}
