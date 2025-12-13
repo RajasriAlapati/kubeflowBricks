@@ -107,9 +107,9 @@ implementation:
         # === Model Architecture Detection ===
         # -------------------------------
         def detect_architecture(state_dict):
-            """
+            '''
             Detect if state_dict is from ResNet or SimpleCNN
-            """
+            '''
             keys = list(state_dict.keys())
             
             # Check for ResNet patterns
@@ -287,7 +287,7 @@ implementation:
             "accuracy_per_epoch": []
         }
 
-        print(f"\nStarting training for {epochs} epochs...")
+        print(f"Starting training for {epochs} epochs...")
         print(f"Replay buffer: {len(replay_buffer)} samples")
         print(f"New data batches: {len(train_loader)}")
         print("-" * 50)
@@ -343,7 +343,7 @@ implementation:
         # -------------------------------------------------------
         # Update replay buffer
         # -------------------------------------------------------
-        print("\nUpdating replay buffer...")
+        print("Updating replay buffer...")
         new_buffer_items = []
 
         # Extract samples from new data
@@ -384,7 +384,6 @@ implementation:
         with open(args.training_report, "w") as f:
             json.dump(report, f, indent=2)
 
-        print("\n" + "="*50)
         print("✓ Continual Learning update complete!")
         print(f"✓ Model saved: {args.updated_model}")
         print(f"✓ Replay buffer saved: {args.updated_replay_buffer}")
@@ -398,7 +397,7 @@ implementation:
       - {inputPath: previous_model}
       - --previous_replay_buffer
       - {inputPath: previous_replay_buffer}
-      - --config_str
+      - --config_st
       - {inputValue: config_str}
       - --updated_model
       - {outputPath: updated_model}
