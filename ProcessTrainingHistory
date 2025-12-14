@@ -12,15 +12,6 @@ inputs:
     type: String
     description: Metric mapping configuration
 
-  - name: tenant_id
-    type: String
-
-  - name: execution_id
-    type: Integer
-
-  - name: projectId
-    type: String
-
   - name: model_id
     type: String
 
@@ -48,9 +39,6 @@ implementation:
         parser = argparse.ArgumentParser()
         parser.add_argument("--training_history_json", required=True)
         parser.add_argument("--mapping_json", required=True)
-        parser.add_argument("--tenant_id", required=True)
-        parser.add_argument("--execution_id", required=True)
-        parser.add_argument("--projectId", required=True)
         parser.add_argument("--model_id", required=True)
         parser.add_argument("--processed_history_json", required=True)
         args = parser.parse_args()
@@ -78,9 +66,6 @@ implementation:
 
         for epoch in range(len(losses)):
             rows.append({
-                "tenant_id": args.tenant_id,
-                "projectId": args.projectId,
-                "execution_id": int(args.execution_id),
                 "model_id": args.model_id,
                 "epoch": int(epoch),
                 "loss": float(losses[epoch]),
@@ -99,12 +84,6 @@ implementation:
       - {inputPath: training_history_json}
       - --mapping_json
       - {inputValue: mapping_json}
-      - --tenant_id
-      - {inputValue: tenant_id}
-      - --execution_id
-      - {inputValue: execution_id}
-      - --projectId
-      - {inputValue: projectId}
       - --model_id
       - {inputValue: model_id}
       - --processed_history_json
