@@ -1,22 +1,33 @@
 name: ProcessTrainingHistory
 description: >
-  Converts training history arrays (loss, accuracy) into epoch-wise
-  key-value records with numeric values for schema ingestion.
+  Converts training history (per-epoch arrays) into row-wise
+  records suitable for DB ingestion.
 
 inputs:
-  - name: training_history
+  - name: training_history_json
     type: String
-    description: JSON string containing loss and accuracy arrays
+    description: JSON with per-epoch metric arrays
 
   - name: mapping_json
     type: String
-    description: Optional mapping configuration (not used in processing)
-    optional: true
+    description: Metric mapping configuration
+
+  - name: tenant_id
+    type: String
+
+  - name: execution_id
+    type: Integer
+
+  - name: projectId
+    type: String
+
+  - name: model_id
+      type: String
 
 outputs:
-  - name: processed_history
+  - name: processed_history_json
     type: String
-    description: Epoch-wise flattened training metrics as JSON list
+    description: Row-wise epoch records
 
 implementation:
   container:
@@ -35,53 +46,71 @@ implementation:
         import os
 
         parser = argparse.ArgumentParser()
-        parser.add_argument("--training_history", type=str, required=True)
-        parser.add_argument("--mapping_json", type=str, required=False)
-        parser.add_argument("--processed_history", type=str, required=True)
+        parser.add_argument("--training_history_json", required=True)
+        parser.add_argument("--mapping_json", required=True)
+        parser.add_argument("--tenant_id", required=True)
+        parser.add_argument("--execution_id", required=True)
+        parser.add_argument("--projectId", required=True)
+        parser.add_argument("--model_id", required=True)
+        parser.add_argument("--processed_history_json", required=True)
         args = parser.parse_args()
 
         # --------------------------------------------------
-        # Load training history
+        # Load inputs
         # --------------------------------------------------
-        with open(args.training_history, "r") as f:
-            history = json.load(f)
+        history = json.load(open(args.training_history_json))
+        mapping = json.loads(args.mapping_json)
 
-        losses = history.get("loss", [])
-        accuracies = history.get("accuracy", [])
+        # Resolve metric arrays
+        loss_key = mapping.get("loss")
+        acc_key = mapping.get("accuracy")
+
+        losses = history.get(loss_key, [])
+        accuracies = history.get(acc_key, [])
 
         if not losses or not accuracies:
-            raise ValueError("Loss or accuracy arrays are missing or empty")
+            raise ValueError("Loss or accuracy arrays missing")
 
         if len(losses) != len(accuracies):
-            raise ValueError("Loss and accuracy arrays must be of same length")
+            raise ValueError("Loss and accuracy lengths do not match")
 
-        processed = []
+        # --------------------------------------------------
+        # Expand into rows
+        # --------------------------------------------------
+        rows = []
 
         for epoch in range(len(losses)):
-            processed.append({
+            rows.append({
+                "tenant_id": args.tenant_id,
+                "projectId": args.projectId,
+                "execution_id": args.execution_id,
+                "model_id": args.model_id
                 "epoch": int(epoch),
                 "loss": float(losses[epoch]),
                 "accuracy": float(accuracies[epoch])
             })
 
         # --------------------------------------------------
-        # Ensure output directory exists
+        # Save output
         # --------------------------------------------------
-        os.makedirs(os.path.dirname(args.processed_history), exist_ok=True)
+        os.makedirs(os.path.dirname(args.processed_history_json), exist_ok=True)
+        with open(args.processed_history_json, "w") as f:
+            json.dump(rows, f, indent=2)
 
-        # --------------------------------------------------
-        # Save processed history
-        # --------------------------------------------------
-        with open(args.processed_history, "w") as f:
-            json.dump(processed, f, indent=2)
-
-        print(f"Processed {len(processed)} epochs")
-        print(f"Saved to {args.processed_history}")
+        print(f"Generated {len(rows)} epoch records")
 
     args:
-      - --training_history
-      - {inputPath: training_history}
+      - --training_history_json
+      - {inputPath: training_history_json}
       - --mapping_json
       - {inputValue: mapping_json}
-      - --processed_history
-      - {outputPath: processed_history}
+      - --tenant_id
+      - {inputValue: tenant_id}
+      - --execution_id
+      - {inputValue: execution_id}
+      - --projectId
+      - {inputValue: projectId}
+      - --model_id
+      - {inputValue: model_id}
+      - --processed_history_json
+      - {outputPath: processed_history_json}
