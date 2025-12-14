@@ -55,9 +55,7 @@ implementation:
         parser.add_argument("--processed_history_json", required=True)
         args = parser.parse_args()
 
-        # --------------------------------------------------
         # Load inputs
-        # --------------------------------------------------
         with open(args.training_history_json, "r") as f:
             history = json.load(f)
 
@@ -75,9 +73,7 @@ implementation:
         if len(losses) != len(accuracies):
             raise ValueError("Loss and accuracy lengths do not match")
 
-        # --------------------------------------------------
         # Expand into rows (epoch-wise)
-        # --------------------------------------------------
         rows = []
 
         for epoch in range(len(losses)):
@@ -91,9 +87,7 @@ implementation:
                 "accuracy": float(accuracies[epoch])
             })
 
-        # --------------------------------------------------
         # Save output
-        # --------------------------------------------------
         os.makedirs(os.path.dirname(args.processed_history_json), exist_ok=True)
         with open(args.processed_history_json, "w") as f:
             json.dump(rows, f, indent=2)
