@@ -1,12 +1,22 @@
 name: ProcessTrainingHistory
-description: Processes training history data, calculates epochs, and converts all numeric values to strings for schema compatibility.
+description: >
+  Converts training history arrays (loss, accuracy) into epoch-wise
+  key-value records with numeric values for schema ingestion.
 
 inputs:
-  - { name: training_history_json, type: String, description: "JSON string containing training history data." }
-  - { name: mapping_json, type: String, description: "JSON string mapping column names to keys in training history." }
+  - name: training_history
+    type: String
+    description: JSON string containing loss and accuracy arrays
+
+  - name: mapping_json
+    type: String
+    description: Optional mapping configuration (not used in processing)
+    optional: true
 
 outputs:
-  - { name: processed_history_json, type: String, description: "JSON string with epochs calculated and all numeric values converted to strings." }
+  - name: processed_history
+    type: String
+    description: Epoch-wise flattened training metrics as JSON list
 
 implementation:
   container:
@@ -15,114 +25,63 @@ implementation:
       - sh
       - -c
       - |
-        pip install requests
         exec "$0" "$@"
       - python3
       - -u
       - -c
       - |
-        import json
         import argparse
+        import json
         import os
-        from typing import Any, Dict, List, Union
-
-        def convert_numeric_to_string(obj: Any) -> Any:
-          
-            if isinstance(obj, dict):
-                return {key: convert_numeric_to_string(value) for key, value in obj.items()}
-            elif isinstance(obj, list):
-                return [convert_numeric_to_string(item) for item in obj]
-            elif isinstance(obj, (int, float)):
-                return str(obj)
-            else:
-                return obj
-
-        def calculate_epochs(history_data: Dict[str, Any]) -> int:
-           
-            train_loss = history_data.get('train_loss', [])
-            if train_loss:
-                return len(train_loss)
-            
-            # Fallback to other arrays if train_loss is not available
-            train_acc = history_data.get('train_acc', [])
-            if train_acc:
-                return len(train_acc)
-                
-            val_loss = history_data.get('val_loss', [])
-            if val_loss:
-                return len(val_loss)
-                
-            val_acc = history_data.get('val_acc', [])
-            if val_acc:
-                return len(val_acc)
-                
-            return 0  # Default if no arrays found
-
-        def process_training_history(history_data: Dict[str, Any], mapping: Dict[str, Any]) -> Dict[str, Any]:
-           
-            processed_data = {}
-            
-            # Calculate epochs from training history
-            epochs = calculate_epochs(history_data)
-            processed_data['epoch'] = str(epochs)
-            
-            for column, keys in mapping.items():
-                if column == 'epoch':
-                    # Skip epoch as we already calculated it
-                    continue
-                    
-                if isinstance(keys, list):
-                    # Handle custom_metrics type mapping
-                    value_to_add = {}
-                    for key in keys:
-                        if key in history_data:
-                            value_to_add[key] = history_data[key]
-                    if value_to_add:
-                        processed_data[column] = convert_numeric_to_string(value_to_add)
-                else:
-                    # Handle single value mapping
-                    if keys in history_data:
-                        value = history_data[keys]
-                        processed_data[column] = convert_numeric_to_string(value)
-            
-            return processed_data
 
         parser = argparse.ArgumentParser()
-        parser.add_argument('--training_history_json', type=str, required=True)
-        parser.add_argument('--mapping_json', type=str, required=True)
-        parser.add_argument('--processed_history_json', type=str, required=True)
+        parser.add_argument("--training_history", type=str, required=True)
+        parser.add_argument("--mapping_json", type=str, required=False)
+        parser.add_argument("--processed_history", type=str, required=True)
         args = parser.parse_args()
 
-        print("Processing Training History")
-        print(f"Input training_history_json: {args.training_history_json}")
-        print(f"Input mapping_json: {args.mapping_json}")
+        # --------------------------------------------------
+        # Load training history
+        # --------------------------------------------------
+        with open(args.training_history, "r") as f:
+            history = json.load(f)
 
-        # Parse input data
-        history_data = json.loads(args.training_history_json)
-        mapping = json.loads(args.mapping_json)
+        losses = history.get("loss", [])
+        accuracies = history.get("accuracy", [])
 
-        # Process the training history
-        processed_data = process_training_history(history_data, mapping)
+        if not losses or not accuracies:
+            raise ValueError("Loss or accuracy arrays are missing or empty")
 
-        print("Processed Data:")
-        print(json.dumps(processed_data, indent=2))
+        if len(losses) != len(accuracies):
+            raise ValueError("Loss and accuracy arrays must be of same length")
 
-        # Create output directory if it doesn't exist
-        output_dir = os.path.dirname(args.processed_history_json)
-        if output_dir and not os.path.exists(output_dir):
-            os.makedirs(output_dir, exist_ok=True)
+        processed = []
 
-        # Write processed data to output file
-        with open(args.processed_history_json, 'w') as f:
-            json.dump(processed_data, f, indent=2)
+        for epoch in range(len(losses)):
+            processed.append({
+                "epoch": int(epoch),
+                "loss": float(losses[epoch]),
+                "accuracy": float(accuracies[epoch])
+            })
 
-        print(f"Successfully processed training history and saved to {args.processed_history_json}")
-        print(f"Calculated epochs: {processed_data.get('epoch', 'Unknown')}")
+        # --------------------------------------------------
+        # Ensure output directory exists
+        # --------------------------------------------------
+        os.makedirs(os.path.dirname(args.processed_history), exist_ok=True)
+
+        # --------------------------------------------------
+        # Save processed history
+        # --------------------------------------------------
+        with open(args.processed_history, "w") as f:
+            json.dump(processed, f, indent=2)
+
+        print(f"Processed {len(processed)} epochs")
+        print(f"Saved to {args.processed_history}")
 
     args:
-      - --training_history_json
-      - {inputValue: training_history_json}
+      - --training_history
+      - {inputPath: training_history}
       - --mapping_json
       - {inputValue: mapping_json}
-      - --processed_history_json
-      - {outputPath: processed_history_json}
+      - --processed_history
+      - {outputPath: processed_history}
