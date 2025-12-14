@@ -22,7 +22,7 @@ inputs:
     type: String
 
   - name: model_id
-      type: String
+    type: String
 
 outputs:
   - name: processed_history_json
@@ -58,10 +58,11 @@ implementation:
         # --------------------------------------------------
         # Load inputs
         # --------------------------------------------------
-        history = json.load(open(args.training_history_json))
+        with open(args.training_history_json, "r") as f:
+            history = json.load(f)
+
         mapping = json.loads(args.mapping_json)
 
-        # Resolve metric arrays
         loss_key = mapping.get("loss")
         acc_key = mapping.get("accuracy")
 
@@ -75,7 +76,7 @@ implementation:
             raise ValueError("Loss and accuracy lengths do not match")
 
         # --------------------------------------------------
-        # Expand into rows
+        # Expand into rows (epoch-wise)
         # --------------------------------------------------
         rows = []
 
@@ -83,8 +84,8 @@ implementation:
             rows.append({
                 "tenant_id": args.tenant_id,
                 "projectId": args.projectId,
-                "execution_id": args.execution_id,
-                "model_id": args.model_id
+                "execution_id": int(args.execution_id),
+                "model_id": args.model_id,
                 "epoch": int(epoch),
                 "loss": float(losses[epoch]),
                 "accuracy": float(accuracies[epoch])
