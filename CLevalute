@@ -393,8 +393,8 @@ implementation:
         # Save KFP metrics file (simple format for visualization)
         os.makedirs(os.path.dirname(args.metrics), exist_ok=True)
         with open(args.metrics, "w") as f:
-            f.write(f"accuracy: {accuracy}")
-            f.write(f"loss: {avg_loss}")
+            f.write(f"accuracy: {float(accuracy)}")
+            f.write(f"loss: {float(avg_loss)}")
             f.write(f"precision: {precision_macro}")
             f.write(f"recall: {recall_macro}")
             f.write(f"f1_score: {f1_macro}")
