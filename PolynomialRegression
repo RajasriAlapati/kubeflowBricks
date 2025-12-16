@@ -1,0 +1,151 @@
+name: PolynomialRegression
+description: >
+  Generic Polynomial Regression brick.
+  Automatically infers feature columns.
+  Degree=1 behaves as Linear Regression.
+
+inputs:
+  - name: data_path
+    type: Dataset
+    description: CSV dataset containing features and target
+  - name: target_column
+    type: String
+    description: Name of target variable column
+  - name: polynomial_degree
+    type: String
+    description: Polynomial degree (1 = Linear Regression)
+
+outputs:
+  - name: trained_model
+    type: Model
+  - name: metrics_json
+    type: String
+  - name: predictions_csv
+    type: Dataset
+
+implementation:
+  container:
+    image: python:3.9-slim
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import json
+        import pandas as pd
+        import pickle
+        import os
+
+        from sklearn.preprocessing import PolynomialFeatures
+        from sklearn.linear_model import LinearRegression
+        from sklearn.metrics import mean_squared_error, r2_score
+
+        # -------------------------
+        # Parse arguments
+        # -------------------------
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--data_path", required=True)
+        parser.add_argument("--target_column", required=True)
+        parser.add_argument("--polynomial_degree", type=int, required=True)
+        parser.add_argument("--trained_model", required=True)
+        parser.add_argument("--metrics_json", required=True)
+        parser.add_argument("--predictions_csv", required=True)
+        args = parser.parse_args()
+
+        # -------------------------
+        # Load dataset
+        # -------------------------
+        df = pd.read_csv(args.data_path)
+
+        if args.target_column not in df.columns:
+            raise ValueError(f"Target column '{args.target_column}' not found in dataset")
+
+        # -------------------------
+        # Auto-detect feature columns
+        # -------------------------
+        numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+        feature_cols = [c for c in numeric_cols if c != args.target_column]
+
+        if not feature_cols:
+            raise ValueError("No numeric feature columns found after excluding target column")
+
+        print("Using feature columns:")
+        for col in feature_cols:
+            print(f" - {col}")
+
+        X = df[feature_cols].values
+        y = df[args.target_column].values
+
+        # -------------------------
+        # Polynomial transformation
+        # degree=1 → Linear Regression
+        # -------------------------
+        poly = PolynomialFeatures(
+            degree=args.polynomial_degree,
+            include_bias=False
+        )
+        X_poly = poly.fit_transform(X)
+
+        # -------------------------
+        # Train model
+        # -------------------------
+        model = LinearRegression()
+        model.fit(X_poly, y)
+
+        # -------------------------
+        # Predictions & metrics
+        # -------------------------
+        y_pred = model.predict(X_poly)
+
+        metrics = {
+            "polynomial_degree": args.polynomial_degree,
+            "num_features": len(feature_cols),
+            "num_samples": int(len(y)),
+            "mse": float(mean_squared_error(y, y_pred)),
+            "r2_score": float(r2_score(y, y_pred)),
+            "feature_columns": feature_cols
+        }
+
+        # -------------------------
+        # Save outputs
+        # -------------------------
+        os.makedirs(os.path.dirname(args.trained_model), exist_ok=True)
+        os.makedirs(os.path.dirname(args.metrics_json), exist_ok=True)
+        os.makedirs(os.path.dirname(args.predictions_csv), exist_ok=True)
+
+        with open(args.trained_model, "wb") as f:
+            pickle.dump(
+                {
+                    "model": model,
+                    "poly_transform": poly,
+                    "feature_columns": feature_cols,
+                    "target_column": args.target_column,
+                    "polynomial_degree": args.polynomial_degree,
+                },
+                f
+            )
+
+        with open(args.metrics_json, "w") as f:
+            json.dump(metrics, f, indent=2)
+
+        df_out = df.copy()
+        df_out["prediction"] = y_pred
+        df_out.to_csv(args.predictions_csv, index=False)
+
+        print("Polynomial Regression completed successfully")
+        print(json.dumps(metrics, indent=2))
+
+    args:
+      - --data_path
+      - {inputPath: data_path}
+      - --target_column
+      - {inputValue: target_column}
+      - --polynomial_degree
+      - {inputValue: polynomial_degree}
+      - --trained_model
+      - {outputPath: trained_model}
+      - --metrics_json
+      - {outputPath: metrics_json}
+      - --predictions_csv
+      - {outputPath: predictions_csv}
