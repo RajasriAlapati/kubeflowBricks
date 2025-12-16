@@ -6,7 +6,7 @@ description: >
 
 inputs:
   - name: data_path
-    type: Dataset
+    type: String
     description: CSV dataset containing features and target
   - name: target_column
     type: String
