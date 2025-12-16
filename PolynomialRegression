@@ -36,6 +36,8 @@ implementation:
         import pandas as pd
         import pickle
         import os
+        import urllib.request
+        import tempfile
 
         from sklearn.preprocessing import PolynomialFeatures
         from sklearn.linear_model import LinearRegression
@@ -56,7 +58,18 @@ implementation:
         # -------------------------
         # Load dataset
         # -------------------------
-        df = pd.read_csv(args.data_path)
+
+        def load_csv(path: str):
+            if path.startswith("http://") or path.startswith("https://"):
+                print("Downloading CSV from URL...")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+                    urllib.request.urlretrieve(path, tmp.name)
+                    return pd.read_csv(tmp.name)
+            else:
+                return pd.read_csv(path)
+
+
+        df = load_csv(args.data_path)
 
         if args.target_column not in df.columns:
             raise ValueError(f"Target column '{args.target_column}' not found in dataset")
