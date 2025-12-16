@@ -151,7 +151,7 @@ implementation:
 
     args:
       - --data_path
-      - {inputPath: data_path}
+      - {inputValue: data_path}
       - --target_column
       - {inputValue: target_column}
       - --polynomial_degree
