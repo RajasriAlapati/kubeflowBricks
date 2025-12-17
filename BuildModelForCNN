@@ -1,4 +1,4 @@
-name: CNNBuildModel
+name: BuildModelForCNN
 description: Instantiates a CNN model using CNNFactory with configuration
 inputs:
   - name: config_str
