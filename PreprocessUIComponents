@@ -23,7 +23,13 @@ implementation:
       - sh
       - -c
       - |
-        python -c "
+        python3 -m pip install --quiet --upgrade pip setuptools wheel
+        python3 -m pip install --quiet "torchvision==0.17.0"
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
         import sys, os, pickle, json, base64, io
         from PIL import Image
         import torch
