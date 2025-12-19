@@ -1,0 +1,526 @@
+name: PCABrick v2.0
+
+description: |
+  Perform Principal Component Analysis (PCA) and its variants on numeric datasets 
+  for dimensionality reduction. Supports multiple input formats, auto-component selection,
+  and comprehensive metadata output.
+
+inputs:
+  - {name: input_data_path, type: String, description: 'Path to input dataset (CSV, Parquet, JSONL, or remote URL)'}
+  - {name: target_column, type: String, default: '', description: 'Optional target column to exclude from PCA (will be preserved in output)'}
+  - {name: n_components, type: String, default: 'auto', description: 'Number of components (integer) or "auto" for automatic selection'}
+  - {name: variance_threshold, type: Float, default: 0.95, description: 'Variance threshold for auto mode in Standard PCA (0.0-1.0)'}
+  - {name: pca_variant, type: String, default: 'Standard PCA', description: 'PCA variant: Standard PCA | Kernel PCA | Incremental PCA | Randomized PCA | Sparse PCA | Factor Analysis (FA) | Independent Component Analysis (ICA)'}
+  - {name: kernel_type, type: String, default: 'rbf', description: 'Kernel for Kernel PCA only (rbf, linear, poly, sigmoid, cosine)'}
+  - {name: scale_data, type: String, default: 'true', description: 'Standardize features before PCA (recommended: true)'}
+  - {name: random_state, type: Integer, default: 42, description: 'Random seed for reproducibility'}
+  - {name: output_format, type: String, default: 'parquet', description: 'Output format: parquet | csv | json'}
+
+outputs:
+  - {name: transformed_data_out, type: String, description: 'Path to transformed dataset'}
+  - {name: pca_model_out, type: String, description: 'Path to saved PCA model'}
+  - {name: pca_metadata_out, type: String, description: 'Path to PCA metadata JSON'}
+
+implementation:
+  container:
+    image: python:3.9
+    command:
+      - sh
+      - -c
+      - |
+        python3 -m pip install --quiet --upgrade pip setuptools wheel
+        python3 -m pip install --quiet "pandas>=1.5.3" "numpy<2,>=1.22" "scikit-learn>=1.3.0" "pyarrow>=10" "requests" "cloudpickle"
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import logging
+        import os
+        import sys
+        import json
+        import traceback
+        from datetime import datetime
+        from io import BytesIO
+        
+        import numpy as np
+        import pandas as pd
+        import requests
+        import cloudpickle
+        
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.decomposition import (
+            PCA,
+            KernelPCA,
+            IncrementalPCA,
+            SparsePCA,
+            FactorAnalysis,
+            FastICA
+        )
+        
+        # =====================================================================
+        # ARGUMENT PARSING
+        # =====================================================================
+        parser = argparse.ArgumentParser(description="PCA Brick v2.0 - Flexible PCA with multiple variants")
+        parser.add_argument('--input_data_path', required=True, help='Input dataset path or URL')
+        parser.add_argument('--target_column', default="", help='Target column to exclude from PCA')
+        parser.add_argument('--n_components', default="auto", help='Number of components or "auto"')
+        parser.add_argument('--variance_threshold', type=float, default=0.95, help='Variance threshold for auto mode')
+        parser.add_argument('--pca_variant', default="Standard PCA", help='PCA variant to use')
+        parser.add_argument('--kernel_type', default="rbf", help='Kernel type for Kernel PCA')
+        parser.add_argument('--scale_data', default="true", help='Whether to scale data')
+        parser.add_argument('--random_state', type=int, default=42, help='Random seed')
+        parser.add_argument('--output_format', default="parquet", choices=["parquet", "csv", "json"])
+        parser.add_argument('--transformed_data_out', required=True, help='Output path for transformed data')
+        parser.add_argument('--pca_model_out', required=True, help='Output path for PCA model')
+        parser.add_argument('--pca_metadata_out', required=True, help='Output path for metadata JSON')
+        args = parser.parse_args()
+        
+        # =====================================================================
+        # LOGGING SETUP
+        # =====================================================================
+        logging.basicConfig(
+            level=logging.INFO,
+            format='[%(levelname)s] %(message)s'
+        )
+        log = logging.getLogger("PCABrick")
+        
+        # =====================================================================
+        # HELPER FUNCTIONS
+        # =====================================================================
+        def ensure_dir_for(path: str) -> None:
+            """Ensure directory exists for given file path"""
+            d = os.path.dirname(path)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+        
+        def load_data(path: str) -> pd.DataFrame:
+            """Load data from local file or remote URL with multiple format support"""
+            log.info(f"Loading data from: {path}")
+            
+            # Handle remote URLs
+            if path.startswith(("http://", "https://")):
+                try:
+                    response = requests.get(path, timeout=120)
+                    response.raise_for_status()
+                    content = BytesIO(response.content)
+                    
+                    if path.endswith(".csv"):
+                        return pd.read_csv(content)
+                    elif path.endswith(".parquet"):
+                        return pd.read_parquet(content)
+                    elif path.endswith((".json", ".jsonl", ".ndjson")):
+                        return pd.read_json(content, lines=True)
+                    elif path.endswith(".xlsx"):
+                        return pd.read_excel(content)
+                    elif path.endswith(".tsv"):
+                        return pd.read_csv(content, sep='\t')
+                    else:
+                        # Try to infer format
+                        log.warning("Unknown file extension, attempting CSV format")
+                        return pd.read_csv(content)
+                except Exception as e:
+                    raise SystemExit(f"Failed to load remote file: {e}")
+            
+            # Handle local files
+            else:
+                if not os.path.exists(path):
+                    raise SystemExit(f"Input file not found: {path}")
+                
+                ext = os.path.splitext(path)[1].lower()
+                try:
+                    if ext == ".csv":
+                        return pd.read_csv(path)
+                    elif ext == ".parquet":
+                        return pd.read_parquet(path)
+                    elif ext in (".json", ".jsonl", ".ndjson"):
+                        return pd.read_json(path, lines=True)
+                    elif ext == ".xlsx":
+                        return pd.read_excel(path)
+                    elif ext == ".tsv":
+                        return pd.read_csv(path, sep='\t')
+                    else:
+                        # Try CSV as default
+                        log.warning(f"Unknown extension '{ext}', attempting CSV format")
+                        return pd.read_csv(path)
+                except Exception as e:
+                    raise SystemExit(f"Failed to load local file: {e}")
+        
+        def clean_and_prepare_data(df: pd.DataFrame, target_col: str = None):
+            """Clean data and separate features from target"""
+            if df.empty:
+                raise ValueError("Input dataset is empty")
+            
+            log.info(f"Original dataset shape: {df.shape}")
+            
+            # Separate target column if specified
+            y = None
+            if target_col and target_col in df.columns:
+                y = df[target_col].copy()
+                X = df.drop(columns=[target_col])
+                log.info(f"Excluded target column: '{target_col}'")
+            else:
+                X = df.copy()
+            
+            # Convert to numeric where possible
+            X = X.apply(pd.to_numeric, errors='ignore')
+            
+            # Select only numeric columns
+            X_numeric = X.select_dtypes(include=[np.number])
+            
+            if X_numeric.shape[1] == 0:
+                raise ValueError("No numeric columns found. PCA requires numeric features.")
+            
+            log.info(f"Numeric columns found: {X_numeric.shape[1]}")
+            
+            # Handle missing and infinite values
+            X_numeric = X_numeric.replace([np.inf, -np.inf], np.nan)
+            
+            if X_numeric.isna().any().any():
+                log.warning("Found NaN values, filling with column means")
+                X_numeric = X_numeric.fillna(X_numeric.mean())
+            
+            # Final check for any remaining non-finite values
+            if not np.isfinite(X_numeric.values).all():
+                raise ValueError("Data still contains non-finite values after cleaning")
+            
+            return X_numeric, y
+        
+        def parse_n_components(n_str: str, variant: str, n_features: int, 
+                               variance_threshold: float, X_data: np.ndarray):
+            """Parse n_components and handle auto mode"""
+            n_str = str(n_str).strip().lower()
+            auto_info = {}
+            
+            if n_str == "auto":
+                if variant.lower() in ["standard pca", "randomized pca"]:
+                    # Auto mode: find components needed for variance threshold
+                    log.info(f"Auto mode: Finding components for {variance_threshold*100}% variance")
+                    
+                    # Fit full PCA to get variance ratios
+                    full_k = min(X_data.shape[0], X_data.shape[1])
+                    temp_pca = PCA(n_components=full_k, svd_solver="full", random_state=42)
+                    temp_pca.fit(X_data)
+                    
+                    cumsum = np.cumsum(temp_pca.explained_variance_ratio_)
+                    n_comp = int(np.searchsorted(cumsum, variance_threshold) + 1)
+                    n_comp = max(1, min(n_comp, n_features))
+                    
+                    auto_info = {
+                        "mode": "variance_threshold",
+                        "threshold": variance_threshold,
+                        "components_selected": n_comp,
+                        "actual_variance_captured": float(cumsum[n_comp-1])
+                    }
+                    log.info(f"Auto selected {n_comp} components (captures {cumsum[n_comp-1]:.2%} variance)")
+                else:
+                    # For other variants, use 50% of features
+                    n_comp = max(1, min(int(n_features * 0.5), n_features))
+                    auto_info = {
+                        "mode": "half_features",
+                        "components_selected": n_comp
+                    }
+                    log.info(f"Auto selected {n_comp} components (50% of features)")
+                
+                return n_comp, auto_info
+            else:
+                # Manual specification
+                try:
+                    n_comp = int(float(n_str))
+                    if n_comp < 1:
+                        raise ValueError("n_components must be >= 1")
+                    if n_comp > n_features:
+                        log.warning(f"Requested {n_comp} components but only {n_features} features available")
+                        n_comp = n_features
+                    
+                    auto_info = {"mode": "manual", "components_selected": n_comp}
+                    return n_comp, auto_info
+                except ValueError as e:
+                    raise ValueError(f"Invalid n_components '{n_str}': must be integer or 'auto'")
+        
+        def build_pca_model(variant: str, n_comp: int, kernel: str, random_state: int):
+            """Build PCA model based on variant"""
+            variant_lower = variant.lower().strip()
+            
+            if variant_lower in ["standard pca", "standard", "pca"]:
+                return PCA(n_components=n_comp, random_state=random_state)
+            
+            elif variant_lower in ["kernel pca", "kernel", "kpca"]:
+                return KernelPCA(n_components=n_comp, kernel=kernel, 
+                               fit_inverse_transform=False, n_jobs=-1, random_state=random_state)
+            
+            elif variant_lower in ["incremental pca", "incremental", "ipca"]:
+                return IncrementalPCA(n_components=n_comp)
+            
+            elif variant_lower in ["randomized pca", "randomized"]:
+                return PCA(n_components=n_comp, svd_solver='randomized', random_state=random_state)
+            
+            elif variant_lower in ["sparse pca", "sparse", "spca"]:
+                return SparsePCA(n_components=n_comp, random_state=random_state, n_jobs=-1)
+            
+            elif variant_lower in ["factor analysis", "factor analysis (fa)", "fa"]:
+                return FactorAnalysis(n_components=n_comp, random_state=random_state)
+            
+            elif variant_lower in ["independent component analysis", "independent component analysis (ica)", "ica", "fastica"]:
+                return FastICA(n_components=n_comp, random_state=random_state)
+            
+            else:
+                raise ValueError(
+                    f"Unknown PCA variant: '{variant}'. "
+                    f"Valid options: Standard PCA, Kernel PCA, Incremental PCA, "
+                    f"Randomized PCA, Sparse PCA, Factor Analysis (FA), "
+                    f"Independent Component Analysis (ICA)"
+                )
+        
+        def extract_variance_stats(model, variant: str):
+            """Extract variance statistics from fitted model"""
+            stats = {
+                "explained_variance": None,
+                "explained_variance_ratio": None,
+                "cumulative_variance_ratio": None,
+                "total_variance_explained": None,
+                "singular_values": None,
+                "noise_variance": None
+            }
+            
+            # Standard variance attributes
+            if hasattr(model, "explained_variance_"):
+                ev = np.asarray(model.explained_variance_, dtype=float)
+                stats["explained_variance"] = ev.tolist()
+                
+                if hasattr(model, "explained_variance_ratio_"):
+                    evr = np.asarray(model.explained_variance_ratio_, dtype=float)
+                    stats["explained_variance_ratio"] = evr.tolist()
+                    stats["cumulative_variance_ratio"] = np.cumsum(evr).tolist()
+                    stats["total_variance_explained"] = float(np.sum(evr))
+            
+            # Kernel PCA special handling
+            elif isinstance(model, KernelPCA) and hasattr(model, "lambdas_"):
+                lambdas = np.asarray(model.lambdas_, dtype=float)
+                total = float(lambdas.sum())
+                stats["explained_variance"] = lambdas.tolist()
+                if total > 0:
+                    evr = lambdas / total
+                    stats["explained_variance_ratio"] = evr.tolist()
+                    stats["cumulative_variance_ratio"] = np.cumsum(evr).tolist()
+                    stats["total_variance_explained"] = float(evr.sum())
+            
+            # Singular values
+            if hasattr(model, "singular_values_"):
+                stats["singular_values"] = np.asarray(model.singular_values_, dtype=float).tolist()
+            
+            # Noise variance (Factor Analysis)
+            if hasattr(model, "noise_variance_"):
+                nv = model.noise_variance_
+                if isinstance(nv, np.ndarray):
+                    stats["noise_variance"] = nv.tolist()
+                elif nv is not None:
+                    stats["noise_variance"] = float(nv)
+            
+            return stats
+        
+        def compute_top_loadings(model, feature_names, top_n=10):
+            """Compute top contributing features for each component"""
+            if not hasattr(model, "components_"):
+                return None
+            
+            components = np.asarray(model.components_, dtype=float)
+            if components.ndim != 2:
+                return None
+            
+            top_n = min(top_n, len(feature_names))
+            loadings = {}
+            
+            for idx in range(components.shape[0]):
+                comp = components[idx]
+                # Get top features by absolute loading
+                top_indices = np.argsort(np.abs(comp))[::-1][:top_n]
+                
+                loadings[f"PC{idx+1}"] = [
+                    {
+                        "feature": str(feature_names[i]),
+                        "loading": float(comp[i]),
+                        "abs_loading": float(np.abs(comp[i]))
+                    }
+                    for i in top_indices
+                ]
+            
+            return loadings
+        
+        def save_outputs(df_transformed, model, metadata, args):
+            """Save all outputs to specified paths"""
+            # Ensure directories exist
+            ensure_dir_for(args.transformed_data_out)
+            ensure_dir_for(args.pca_model_out)
+            ensure_dir_for(args.pca_metadata_out)
+            
+            # Save transformed data
+            fmt = args.output_format.lower()
+            if fmt == "parquet":
+                df_transformed.to_parquet(args.transformed_data_out, index=False)
+            elif fmt == "csv":
+                df_transformed.to_csv(args.transformed_data_out, index=False)
+            elif fmt == "json":
+                df_transformed.to_json(args.transformed_data_out, orient="records", lines=True)
+            
+            log.info(f"Saved transformed data: {args.transformed_data_out}")
+            
+            # Save model using cloudpickle
+            with open(args.pca_model_out, "wb") as f:
+                cloudpickle.dump(model, f)
+            log.info(f"Saved PCA model: {args.pca_model_out}")
+            
+            # Save metadata as JSON
+            with open(args.pca_metadata_out, "w") as f:
+                json.dump(metadata, f, indent=2, ensure_ascii=False)
+            log.info(f"Saved metadata: {args.pca_metadata_out}")
+        
+        # =====================================================================
+        # MAIN EXECUTION
+        # =====================================================================
+        try:
+            print("=" * 80)
+            print("PCA BRICK v2.0 - ENHANCED PCA TRANSFORMATION")
+            print("=" * 80)
+            
+            # Step 1: Load data
+            log.info("[STEP 1/7] Loading dataset...")
+            df_raw = load_data(args.input_data_path.strip())
+            log.info(f"Dataset loaded: {df_raw.shape[0]} rows × {df_raw.shape[1]} columns")
+            
+            # Step 2: Clean and prepare data
+            log.info("[STEP 2/7] Cleaning and preparing data...")
+            X_clean, y_target = clean_and_prepare_data(df_raw, args.target_column.strip() or None)
+            feature_names = list(X_clean.columns)
+            log.info(f"Numeric features: {len(feature_names)}")
+            
+            # Step 3: Scale data if requested
+            log.info("[STEP 3/7] Scaling data...")
+            if args.scale_data.lower() == "true":
+                scaler = StandardScaler()
+                X_scaled = scaler.fit_transform(X_clean.values)
+                log.info("Data standardized (mean=0, std=1)")
+            else:
+                X_scaled = X_clean.values
+                log.info("Data used without scaling")
+            
+            # Step 4: Determine number of components
+            log.info("[STEP 4/7] Determining number of components...")
+            n_comp, auto_info = parse_n_components(
+                args.n_components,
+                args.pca_variant,
+                len(feature_names),
+                args.variance_threshold,
+                X_scaled
+            )
+            
+            # Step 5: Build and fit PCA model
+            log.info("[STEP 5/7] Building and fitting PCA model...")
+            log.info(f"Variant: {args.pca_variant}")
+            log.info(f"Components: {n_comp}")
+            
+            model = build_pca_model(args.pca_variant, n_comp, args.kernel_type, args.random_state)
+            X_transformed = model.fit_transform(X_scaled)
+            
+            log.info(f"Transformation complete: {X_transformed.shape[0]} rows × {X_transformed.shape[1]} components")
+            
+            # Step 6: Create output dataframe
+            log.info("[STEP 6/7] Creating output dataset...")
+            pc_names = [f"PC{i+1}" for i in range(X_transformed.shape[1])]
+            df_output = pd.DataFrame(X_transformed, columns=pc_names)
+            
+            # Add target column back if it existed
+            if y_target is not None:
+                df_output[args.target_column] = y_target.values
+                log.info(f"Target column '{args.target_column}' preserved in output")
+            
+            # Step 7: Generate metadata
+            log.info("[STEP 7/7] Generating metadata...")
+            variance_stats = extract_variance_stats(model, args.pca_variant)
+            top_loadings = compute_top_loadings(model, feature_names, top_n=10)
+            
+            metadata = {
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "pca_brick_version": "2.0",
+                "configuration": {
+                    "pca_variant": args.pca_variant,
+                    "n_components_input": args.n_components,
+                    "n_components_resolved": n_comp,
+                    "variance_threshold": args.variance_threshold if args.n_components.lower() == "auto" else None,
+                    "kernel_type": args.kernel_type if "kernel" in args.pca_variant.lower() else None,
+                    "data_scaled": args.scale_data.lower() == "true",
+                    "random_state": args.random_state
+                },
+                "auto_selection": auto_info,
+                "data_shapes": {
+                    "original": {"rows": df_raw.shape[0], "columns": df_raw.shape[1]},
+                    "numeric": {"rows": X_clean.shape[0], "columns": X_clean.shape[1]},
+                    "transformed": {"rows": X_transformed.shape[0], "columns": X_transformed.shape[1]}
+                },
+                "feature_names": feature_names,
+                "component_names": pc_names,
+                "target_column": args.target_column if args.target_column else None,
+                "variance_statistics": variance_stats,
+                "top_contributing_features": top_loadings
+            }
+            
+            # Save all outputs
+            save_outputs(df_output, model, metadata, args)
+            
+            # Print summary
+            print("=" * 80)
+            print("PCA TRANSFORMATION SUMMARY")
+            print("=" * 80)
+            print(f"Original shape:    {df_raw.shape[0]} rows × {df_raw.shape[1]} columns")
+            print(f"Numeric features:  {len(feature_names)} columns")
+            print(f"Transformed shape: {X_transformed.shape[0]} rows × {X_transformed.shape[1]} components")
+            print(f"PCA variant:       {args.pca_variant}")
+            print(f"Data scaled:       {args.scale_data}")
+            
+            if variance_stats["total_variance_explained"] is not None:
+                print(f"Variance captured: {variance_stats['total_variance_explained']:.2%}")
+            
+            print("\nOutputs saved:")
+            print(f"  • Transformed data: {args.transformed_data_out}")
+            print(f"  • PCA model:        {args.pca_model_out}")
+            print(f"  • Metadata JSON:    {args.pca_metadata_out}")
+            print("=" * 80)
+            print("✓ PCA BRICK COMPLETED SUCCESSFULLY")
+            print("=" * 80)
+            
+        except Exception as exc:
+            print("=" * 80, file=sys.stderr)
+            print("✗ PCA BRICK FAILED", file=sys.stderr)
+            print("=" * 80, file=sys.stderr)
+            print(f"Error: {exc}", file=sys.stderr)
+            print("\nFull traceback:", file=sys.stderr)
+            traceback.print_exc()
+            print("=" * 80, file=sys.stderr)
+            sys.exit(1)
+
+    args:
+      - --input_data_path
+      - {inputValue: input_data_path}
+      - --target_column
+      - {inputValue: target_column}
+      - --n_components
+      - {inputValue: n_components}
+      - --variance_threshold
+      - {inputValue: variance_threshold}
+      - --pca_variant
+      - {inputValue: pca_variant}
+      - --kernel_type
+      - {inputValue: kernel_type}
+      - --scale_data
+      - {inputValue: scale_data}
+      - --random_state
+      - {inputValue: random_state}
+      - --output_format
+      - {inputValue: output_format}
+      - --transformed_data_out
+      - {outputPath: transformed_data_out}
+      - --pca_model_out
+      - {outputPath: pca_model_out}
+      - --pca_metadata_out
+      - {outputPath: pca_metadata_out}
