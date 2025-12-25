@@ -247,7 +247,7 @@ implementation:
         print(f"Model created with {sum(p.numel() for p in net.parameters())} parameters")
 
         # Train based on mode
-        print(f"\nStarting {training_mode} training...")
+        print(f"Starting {training_mode} training...")
         
         if use_cafo:
             results = net.train_cafo(
@@ -280,7 +280,7 @@ implementation:
             model_trained_flag = {"backprop_trained": True}
 
         # Save model & history
-        print("\nSaving model and training history...")
+        print("Saving model and training history...")
         os.makedirs(os.path.dirname(args.trained_model), exist_ok=True)
         os.makedirs(os.path.dirname(args.training_history), exist_ok=True)
 
@@ -302,7 +302,7 @@ implementation:
         with open(args.training_history, "w") as f:
             json.dump(history, f, indent=2)
 
-        print(f"\n✓ {training_mode} training completed successfully!")
+        print(f"✓ {training_mode} training completed successfully!")
         print(f"✓ Model saved to: {args.trained_model}")
         print(f"✓ History saved to: {args.training_history}")
         
