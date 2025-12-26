@@ -96,6 +96,10 @@ implementation:
         # Patched ResNet with backpropagation method
         class PatchedResNet(ffresnet.ResNet):
             def __init__(self, config):
+                # Set dropout BEFORE calling super().__init__() 
+                # because parent class needs it during initialization
+                self.dropout = config.get('dropout', 0.0)
+                self.config = config
                 super().__init__(config)
             
             def train_backpropagation(self, X_train, y_train, X_val=None, y_val=None, verbose=True):
